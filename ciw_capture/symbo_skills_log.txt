@@ -1,0 +1,41 @@
+Make schematic editable
+_schHiChangeEditMode("a")
+从打开Schematic到从Schematic转成cell view
+schHiViewToView()
+hiiSetCurrentForm('schViewToViewForm)
+hiFormDone(schViewToViewForm)
+hiiSetCurrentForm('schSgForm)
+hiFormDone(schSgForm)
+
+How to delete？
+Library Manager deleting cellview "LLM_Layout_Design/IO_RING_YCT6/symbol".
+Deleted cellview 'LLM_Layout_Design/IO_RING_YCT6/symbol'.
+
+调整矩形框大小（矩形框与信号接，方便人看）
+_oiSelectItem(dwindow('oiAssistant3) "1" 1)
+_oiSetItem(dwindow('oiAssistant3) "1" 1 "2.75")
+mouseSingleSelectPt()
+mouseSingleSelectPt()
+mouseSingleSelectPt()
+mouseSingleSelectPt()
+_oiSelectItem(dwindow('oiAssistant3) "1" 1)
+_oiSetItem(dwindow('oiAssistant3) "1" 1 "3")
+_oiSelectItem(dwindow('oiAssistant3) "2" 1)
+_oiSetItem(dwindow('oiAssistant3) "2" 1 "4")
+_oiSelectItem(dwindow('oiAssistant3) "3" 1)
+_oiSetItem(dwindow('oiAssistant3) "3" 1 "2")
+_oiSelectItem(dwindow('oiAssistant3) "4" 1)
+_oiSetItem(dwindow('oiAssistant3) "4" 1 "1")
+_oiSelectItem(dwindow('oiAssistant3) "5" 1)
+_oiSetItem(dwindow('oiAssistant3) "5" 1 "4")
+_oiSelectItem(dwindow('oiAssistant3) "6" 1)
+_oiSetItem(dwindow('oiAssistant3) "6" 1 "5")
+hiZoomOutAtMouse()
+hiZoomOutAtMouse()
+hiZoomOutAtMouse()
+hiZoomInAtMouse()
+hiZoomInAtMouse()
+_oiSelectItem(dwindow('oiAssistant3) "7" 1)
+_oiSetItem(dwindow('oiAssistant3) "7" 1 "3")
+_oiSelectItem(dwindow('oiAssistant3) "8" 1)
+_oiSetItem(dwindow('oiAssistant3) "8" 1 "4")
