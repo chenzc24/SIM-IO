@@ -4,7 +4,7 @@ Step 1: Export symbol from primary schematic (TSG)
 Step 2: Redistribute symbol pins (extract → calculate layout → apply)
 Step 3: Create _tb cellview
 Step 4: Place DUT + extract pins + add labels + add sources
-Step 5: ADE assembler (blocked — needs SKILL code from user)
+Step 5: Netlist export + Spectre run + verification (optional)
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-# Resolve paths — this file lives in SIM_IO/src/
+# Resolve paths — this file lives in SIM-IO/src/
 _SRC_DIR = Path(__file__).resolve().parent
 _SIM_IO = _SRC_DIR.parent
 _BRIDGE_LITE = _SIM_IO.parent / "virtuoso-bridge-lite" / "src"
@@ -59,9 +59,9 @@ _OUTPUT_ROOT = _SIM_IO / "output"
 
 
 def create_run_dir() -> Path:
-    """Create and return a timestamped output directory under SIM_IO/output/.
+    """Create and return a timestamped output directory under SIM-IO/output/.
 
-    Returns path like ``SIM_IO/output/20260430_153045/``.
+    Returns path like ``SIM-IO/output/20260430_153045/``.
     """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = _OUTPUT_ROOT / ts
@@ -96,6 +96,8 @@ class SimFlowResult:
     pins: list[PinInfo]
     labels_added: list[str]
     sources_placed: list[str]
+    sim_run_ok: Optional[bool] = None
+    sim_verdict: Optional[str] = None
     run_dir: Optional[str] = None
 
     def save(self, run_dir: Path) -> None:
@@ -557,12 +559,18 @@ def run_sim_flow(
     primary_cell: str,
     *,
     vdd_value: float = 1.8,
+    run_sim: bool = False,
+    model_include: str = "",
+    cds_lib: str = "",
+    spectre_mode: str = "spectre",
     client: Optional[VirtuosoClient] = None,
 ) -> SimFlowResult:
-    """Run the full simulation build-up flow (Steps 1-3).
+    """Run the full simulation build-up flow (Steps 1-4) and optionally run spectre.
 
-    Step 4 (ADE assembler) is deferred — blocked by ADE permission.
-    All outputs are saved under ``SIM_IO/output/<timestamp>/``.
+    When ``run_sim=True``, also executes Steps 5a-5d:
+      netlist export → deck build → spectre run → result verification.
+
+    All outputs are saved under ``SIM-IO/output/<timestamp>/``.
     """
     if client is None:
         client = VirtuosoClient.from_env()
@@ -593,6 +601,9 @@ def run_sim_flow(
     # Step 4b: Extract pin info (from redistributed symbol)
     pins = extract_dut_pins(client, lib, primary_cell)
 
+    # Write pin_info.json for LLM classification
+    write_pin_info_json(pins, lib, primary_cell, vdd_value, run_dir / "pin_info.json")
+
     # Step 4c: Add wire labels on DUT pins
     labels = add_wire_labels(client, lib, tb_cell, pins) if pins else []
 
@@ -600,6 +611,29 @@ def run_sim_flow(
     sources = place_sources_and_loads(
         client, lib, tb_cell, pins, vdd_value=vdd_value,
     ) if pins else []
+
+    # Step 5: Run simulation (optional)
+    sim_run_ok = None
+    sim_verdict = None
+    if run_sim and pins:
+        from sim_run import run_sim_run
+        from sim_deck_template import SimConfig
+        from sim_verify import verify_results
+
+        cfg = SimConfig(model_include=model_include)
+        sim_result = run_sim_run(
+            lib, tb_cell, pins, run_dir,
+            config=cfg,
+            client=client,
+            cds_lib=cds_lib,
+            spectre_mode=spectre_mode,
+        )
+        sim_run_ok = sim_result.spectre_ok
+
+        if sim_result.measurements:
+            report = verify_results(sim_result.measurements, vdd=vdd_value, cell=tb_cell)
+            sim_verdict = report.verdict
+            report.save(run_dir / "verify.json")
 
     result = SimFlowResult(
         lib=lib,
@@ -612,6 +646,8 @@ def run_sim_flow(
         pins=pins,
         labels_added=labels,
         sources_placed=sources,
+        sim_run_ok=sim_run_ok,
+        sim_verdict=sim_verdict,
     )
 
     # Save result to timestamped output dir
@@ -639,8 +675,10 @@ def run_sim_flow(
         t = classify_pin_heuristic(p)
         types[t] = types.get(t, 0) + 1
     print(f"  Pin types:         {dict(sorted(types.items()))}")
-    # # Step 5: ADE assembler + simulation (deferred — ADE permission required)
-    print(f"\n  Next: ADE assembler + simulation (deferred — ADE permission required)")
+    if sim_run_ok is not None:
+        print(f"  Spectre run:       {'OK' if sim_run_ok else 'FAILED'}")
+    if sim_verdict is not None:
+        print(f"  Verify verdict:    {sim_verdict}")
     print(f"{'='*60}\n")
 
     return result

@@ -1,5 +1,5 @@
 """
-Pin Classification Module for SIM_IO Simulation Flow.
+Pin Classification Module for SIM-IO Simulation Flow.
 
 Extracted from sim_flow.py to support LLM-driven pin type classification.
 The classification rules live in the skill reference docs — this module

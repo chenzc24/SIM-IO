@@ -1,5 +1,5 @@
 ---
-name: sim-tb-builder
+name: SIM-IO
 description: >
   Build simulation testbenches for IO Ring / mixed-signal designs in Cadence Virtuoso.
   Automates the full flow: symbol export → pin redistribution → testbench creation →
@@ -10,7 +10,7 @@ description: >
   "source placement", or "stimulus generation" in the context of Virtuoso simulation.
 ---
 
-# SIM_IO — Simulation Testbench Builder
+# SIM-IO — Simulation Testbench Builder
 
 ## Overview
 
