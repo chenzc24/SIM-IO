@@ -1,25 +1,29 @@
 """
 IO Ring Simulation Flow — Pipeline Module
 Step 1: Export symbol from primary schematic (TSG)
-Step 2: Create _tb cellview
-Step 3: Place DUT + extract pins + add source/load labels
-Step 4: ADE assembler (blocked — needs SKILL code from user)
+Step 2: Redistribute symbol pins (extract → calculate layout → apply)
+Step 3: Create _tb cellview
+Step 4: Place DUT + extract pins + add labels + add sources
+Step 5: ADE assembler (blocked — needs SKILL code from user)
 """
 
 from __future__ import annotations
 
 import json
 import re
+import shutil
 import sys
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-# Resolve virtuoso-bridge-lite
-_BRIDGE_LITE = Path(__file__).resolve().parent.parent / "virtuoso-bridge-lite" / "src"
-_T28_ROOT = Path(__file__).resolve().parent.parent / "io-ring-orchestrator-T28"
-for p in (_BRIDGE_LITE, _T28_ROOT):
+# Resolve paths — this file lives in SIM_IO/src/
+_SRC_DIR = Path(__file__).resolve().parent
+_SIM_IO = _SRC_DIR.parent
+_BRIDGE_LITE = _SIM_IO.parent / "virtuoso-bridge-lite" / "src"
+_T28_ROOT = _SIM_IO.parent / "io-ring-orchestrator-T28"
+for p in (_SRC_DIR, _BRIDGE_LITE, _T28_ROOT):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
@@ -29,9 +33,29 @@ from virtuoso_bridge.virtuoso.schematic.ops import (
     schematic_label_instance_term as label_inst_term,
 )
 from io_ring.bridge import load_skill_file
+from symbol_layout_engine import (
+    LayoutConfig,
+    LayoutEngine,
+    Side,
+    generate_apply_skill,
+    parse_symbol_info,
+)
+from pin_types import (
+    PinInfo,
+    PinClassification,
+    ClassificationResult,
+    PinType,
+    PAD_RULES,
+    SIDE_CONFIGS,
+    classify_pin_heuristic,
+    load_pin_classifications,
+    write_pin_info_json,
+    build_classification_map,
+    get_rule_for_pin,
+)
 
-_SKILL_DIR = Path(__file__).resolve().parent / "skill_code"
-_OUTPUT_ROOT = Path(__file__).resolve().parent / "output"
+_SKILL_DIR = _SIM_IO / "skill_code"
+_OUTPUT_ROOT = _SIM_IO / "output"
 
 
 def create_run_dir() -> Path:
@@ -45,87 +69,19 @@ def create_run_dir() -> Path:
     return run_dir
 
 
-# ── Pin Classification & Stimulus/Load Rules ─────────────────
+def log_skill_code(run_dir: Path, skill_path: str | Path) -> None:
+    """Copy a skill file into ``run_dir/skill_code/`` for logging."""
+    src = Path(skill_path)
+    if not src.is_file():
+        return
+    dest_dir = run_dir / "skill_code"
+    dest_dir.mkdir(exist_ok=True)
+    shutil.copy2(src, dest_dir / src.name)
 
-def classify_pin(pin: PinInfo) -> str:
-    """Classify a pin by name heuristic + direction → pad_type.
-
-    Returns one of: power, ground, digital_input, digital_output,
-    digital_bidirectional.
-    """
-    name_upper = pin.name.upper()
-    if "VDD" in name_upper or "VCC" in name_upper or "DVDD" in name_upper or "AVDD" in name_upper:
-        return "power"
-    if "VSS" in name_upper or "GND" in name_upper or "DVSS" in name_upper or "AVSS" in name_upper:
-        return "ground"
-    if pin.direction == "input":
-        return "digital_input"
-    if pin.direction == "output":
-        return "digital_output"
-    return "digital_bidirectional"
-
-
-# stimulus/load rules — keyed by pad_type.
-# Each entry: source and/or load with analogLib cell + default CDF params.
-# The special value "VDD" in params is replaced at runtime by the vdd_value arg.
-PAD_RULES = {
-    "digital_input": {
-        "source": {
-            "lib": "analogLib", "cell": "vpulse",
-            "term": "PLUS", "ref_term": "MINUS",
-            "params": {"v1": "0", "v2": "VDD", "period": "100n",
-                       "rise": "1n", "fall": "1n", "width": "50n"},
-        },
-    },
-    "digital_output": {
-        "load": {
-            "lib": "analogLib", "cell": "cap",
-            "term": "PLUS", "ref_term": "MINUS",
-            "params": {"c": "10p"},
-        },
-    },
-    "digital_bidirectional": {
-        "source": {
-            "lib": "analogLib", "cell": "vpulse",
-            "term": "PLUS", "ref_term": "MINUS",
-            "params": {"v1": "0", "v2": "VDD", "period": "100n",
-                       "rise": "1n", "fall": "1n", "width": "50n"},
-        },
-        "load": {
-            "lib": "analogLib", "cell": "cap",
-            "term": "PLUS", "ref_term": "MINUS",
-            "params": {"c": "10p"},
-        },
-    },
-    "power": {
-        "source": {
-            "lib": "analogLib", "cell": "vdc",
-            "term": "PLUS", "ref_term": "MINUS",
-            "params": {"vdc": "VDD"},
-        },
-    },
-    "ground": {
-        "source": {
-            "lib": "analogLib", "cell": "vdc",
-            "term": "PLUS", "ref_term": "MINUS",
-            "params": {"vdc": "0"},
-        },
-    },
-}
 
 # Spacing from DUT pin center to source/load center (schematic units)
-_SRC_LOAD_OFFSET = 2.5
-
-
-# ── Data types ──────────────────────────────────────────────
-
-@dataclass
-class PinInfo:
-    name: str
-    direction: str      # "input" / "output" / "inputOutput"
-    x: float
-    y: float
-    side: str           # "left" / "right" / "top" / "bottom"
+_SRC_LOAD_OFFSET = 5.0
+_LOAD_OFFSET = 8.0
 
 
 @dataclass
@@ -134,6 +90,7 @@ class SimFlowResult:
     primary_cell: str
     tb_cell: str
     symbol_exported: bool
+    redistributed: bool
     tb_created: bool
     dut_placed: bool
     pins: list[PinInfo]
@@ -185,6 +142,96 @@ def export_symbol(client: VirtuosoClient, lib: str, cell: str) -> bool:
     return ok
 
 
+# ── Step 2: Redistribute Symbol Pins ────────────────────────────
+
+def redistribute_symbol(
+    client: VirtuosoClient,
+    lib: str,
+    cell: str,
+    run_dir: Path,
+) -> bool:
+    """Redistribute symbol pins evenly on 4 sides.
+
+    Sub-steps:
+      2a. Regenerate symbol via TSG (fresh start)
+      2b. Extract symbol info (rects, lines, labels, terminals)
+      2c. Calculate new layout (body + pin positions) in pure Python
+      2d. Apply layout via generated SKILL script
+
+    Returns True if redistribution succeeded.
+    """
+    print(f"[step2] Redistributing symbol pins for {lib}/{cell}")
+
+    # 2a: Fresh TSG — delete old symbol and regenerate
+    client.execute_skill(f'ddDeleteCellView("{lib}" "{cell}" "symbol")')
+    client.execute_skill('schSetEnv("ssgSortPins" "geometric")')
+    r = client.execute_skill(
+        f'let((pl) '
+        f'pl = schSchemToPinList("{lib}" "{cell}" "schematic") '
+        f'schPinListToSymbol("{lib}" "{cell}" "symbol" pl))'
+    )
+    if r.errors:
+        print(f"[step2a] ERROR: TSG failed: {r.errors}")
+        return False
+    print(f"[step2a] Fresh TSG: OK")
+
+    # 2b: Extract symbol info
+    load_r = client.load_il(str(_SKILL_DIR / "extract_symbol_info.il"))
+    if not load_r.ok:
+        print(f"[step2b] ERROR loading extractor: {load_r.errors}")
+        return False
+    r = client.execute_skill(f'extractSymbolInfo("{lib}" "{cell}")', timeout=60)
+    if r.errors:
+        print(f"[step2b] ERROR extracting: {r.errors}")
+        return False
+
+    info = parse_symbol_info(r.output)
+    print(f"[step2b] Extracted: {len(info.rects)} rects, {len(info.lines)} lines, "
+          f"{len(info.labels)} labels, {len(info.terminals)} terminals")
+
+    # Save raw extraction data
+    (run_dir / "extract_raw.txt").write_text(r.output or "", encoding="utf-8")
+
+    # 2c: Calculate layout
+    engine = LayoutEngine(LayoutConfig())
+    result = engine.redesign(info)
+    body = result.body
+    for side_name in ["left", "right", "top", "bottom"]:
+        count = sum(1 for p in result.pins if p.side.value == side_name)
+        print(f"[step2c] {side_name}: {count} pins")
+
+    # Save layout result
+    layout_data = {
+        "lib": lib, "cell": cell,
+        "body": {k: v for k, v in asdict(body).items()},
+        "pins": [{k: (v.value if isinstance(v, Side) else v)
+                  for k, v in asdict(p).items()} for p in result.pins],
+    }
+    (run_dir / "layout_result.json").write_text(
+        json.dumps(layout_data, indent=2), encoding="utf-8"
+    )
+
+    # 2d: Apply layout
+    skill_code = generate_apply_skill(lib, cell, result, engine.config)
+    apply_il = run_dir / "apply_layout.il"
+    apply_il.write_text(skill_code, encoding="utf-8")
+
+    load_r = client.load_il(str(apply_il), timeout=120)
+    if not load_r.ok:
+        print(f"[step2d] ERROR: {load_r.errors}")
+        return False
+    print(f"[step2d] Layout applied: OK")
+
+    # Verify
+    sym = f'dbOpenCellViewByType("{lib}" "{cell}" "symbol" nil "r")'
+    r = client.execute_skill(f'{sym}~>bBox')
+    print(f"[step2] Verify bBox: {r.output}")
+    r = client.execute_skill(f'length({sym}~>terminals)')
+    print(f"[step2] Verify terminals: {r.output}")
+
+    return True
+
+
 # ── Symbol Editing Ops ────────────────────────────────────────
 
 
@@ -218,7 +265,7 @@ def symbol_move_pin(
     return ok
 
 
-# ── Step 2: Create TB Cellview ──────────────────────────────
+# ── Step 3: Create TB Cellview ──────────────────────────────
 
 def create_tb_cellview(client: VirtuosoClient, lib: str, primary_cell: str) -> str:
     """Create a new schematic cellview named {primary_cell}_tb.
@@ -232,35 +279,36 @@ def create_tb_cellview(client: VirtuosoClient, lib: str, primary_cell: str) -> s
         f'dbOpenCellViewByType("{lib}" "{tb_cell}" "schematic" "schematic" "w")'
     )
     if not r.output or r.output.strip().lower() == "nil":
-        print(f"[step2] ERROR: Failed to create {lib}/{tb_cell}/schematic")
+        print(f"[step3] ERROR: Failed to create {lib}/{tb_cell}/schematic")
         return tb_cell
 
     # Save the empty cellview
     client.execute_skill(
         f'dbSave(dbOpenCellViewByType("{lib}" "{tb_cell}" "schematic" "schematic" "a"))'
     )
-    print(f"[step2] Created: {lib}/{tb_cell}/schematic")
+    print(f"[step3] Created: {lib}/{tb_cell}/schematic")
     return tb_cell
 
 
-# ── Step 3a: Place DUT Instance ─────────────────────────────
+# ── Step 4a: Place DUT Instance ─────────────────────────────
 
 def place_dut(client: VirtuosoClient, lib: str, tb_cell: str, primary_cell: str) -> bool:
     """Place the primary cell's symbol as DUT instance in _tb schematic."""
     with client.schematic.edit(lib, tb_cell, mode="a") as sch:
         cmd = inst(lib, primary_cell, "symbol", "DUT", 2.5, 0.0, "R0")
         sch.add(cmd)
-    print(f"[step3a] DUT placed: OK")
+    print(f"[step4a] DUT placed: OK")
     return True
 
 
-# ── Step 3b: Extract DUT Pin Info ───────────────────────────
+# ── Step 4b: Extract DUT Pin Info ───────────────────────────
 
 def extract_dut_pins(client: VirtuosoClient, lib: str, primary_cell: str) -> list[PinInfo]:
     """Extract all pin info from the symbol view of the primary cell.
 
     Queries terminal names, directions, and positions from the symbol cellview.
-    Determines pin side (left/right/top/bottom) from position relative to symbol center.
+    Determines pin side by distance to bBox edges (same logic as layout engine).
+    CORE pins get their side flipped so TB wires point inward (toward DUT center).
     """
     sym_cv = f'dbOpenCellViewByType("{lib}" "{primary_cell}" "symbol" nil "r")'
 
@@ -268,35 +316,31 @@ def extract_dut_pins(client: VirtuosoClient, lib: str, primary_cell: str) -> lis
     r_names = client.execute_skill(f'{sym_cv}~>terminals~>name')
     names = re.findall(r'"([^"]+)"', r_names.output or "")
     if not names:
-        print(f"[step3b] ERROR: No terminals found in {lib}/{primary_cell}/symbol")
+        print(f"[step4b] ERROR: No terminals found in {lib}/{primary_cell}/symbol")
         return []
 
     # Get terminal directions
     r_dirs = client.execute_skill(f'{sym_cv}~>terminals~>direction')
     directions = re.findall(r'"([^"]+)"', r_dirs.output or "")
 
-    # Get symbol bBox to determine center
+    # Get symbol bBox edges for side classification
     r_bbox = client.execute_skill(f'{sym_cv}~>bBox')
-    # Parse ((x1 y1) (x2 y2))
     bbox_match = re.findall(r'[-\d.]+', r_bbox.output or "")
     if len(bbox_match) >= 4:
-        cx = (float(bbox_match[0]) + float(bbox_match[2])) / 2.0
-        cy = (float(bbox_match[1]) + float(bbox_match[3])) / 2.0
+        body_L = float(bbox_match[0])
+        body_B = float(bbox_match[1])
+        body_R = float(bbox_match[2])
+        body_T = float(bbox_match[3])
     else:
-        cx, cy = 0.0, 0.0
+        body_L, body_B, body_R, body_T = -1.0, -1.0, 1.0, 1.0
 
-    # Get pin figure positions from the symbol
-    # TSG symbols: each terminal has a pin with a fig (rect on pin/drawing layer)
-    # We need to get the center of each pin's fig
-    # Extract pin bBoxes per terminal
     pins = []
     for i, name in enumerate(names):
         direction = directions[i] if i < len(directions) else "inputOutput"
 
-        # Get this terminal's pin figure bBox
-        # Use nth to access terminal by index
+        # Get first pin figure bBox (handles multi-pin terminals like VSS)
         r_pin = client.execute_skill(
-            f'nth({i} {sym_cv}~>terminals)~>pins~>figs~>bBox'
+            f'car(car(nth({i} {sym_cv}~>terminals)~>pins)~>figs)~>bBox'
         )
         pin_match = re.findall(r'[-\d.]+', r_pin.output or "")
         if len(pin_match) >= 4:
@@ -305,48 +349,22 @@ def extract_dut_pins(client: VirtuosoClient, lib: str, primary_cell: str) -> lis
         else:
             px, py = 0.0, 0.0
 
-        # Determine side
-        if px < cx - 0.1:
-            side = "left"
-        elif px > cx + 0.1:
-            side = "right"
-        elif py > cy + 0.1:
-            side = "top"
-        else:
-            side = "bottom"
+        # Determine side by distance to bBox edges (matches layout engine logic)
+        dists = {
+            "left": abs(px - body_L),
+            "right": abs(px - body_R),
+            "top": abs(py - body_T),
+            "bottom": abs(py - body_B),
+        }
+        side = min(dists, key=dists.__getitem__)
 
         pins.append(PinInfo(name=name, direction=direction, x=px, y=py, side=side))
 
-    print(f"[step3b] Extracted {len(pins)} pins from {lib}/{primary_cell}/symbol")
+    print(f"[step4b] Extracted {len(pins)} pins from {lib}/{primary_cell}/symbol")
     return pins
 
 
-# ── Step 3c: Add Wire + Label (label-based wiring) ──────────
-
-# Side config: wire extend direction + label offset + alignment
-# Same pattern as io-ring-orchestrator-T28/io_ring/schematic/generator.py
-_SIDE_CONFIGS = {
-    "right": {
-        "extend_x": 0.750, "extend_y": 0.0,
-        "label_offset_x": 0.25, "label_offset_y": 0.0,
-        "label_align": "lowerLeft", "label_rotation": "R0",
-    },
-    "left": {
-        "extend_x": -0.750, "extend_y": 0.0,
-        "label_offset_x": -0.25, "label_offset_y": 0.0,
-        "label_align": "lowerRight", "label_rotation": "R0",
-    },
-    "top": {
-        "extend_x": 0.0, "extend_y": 0.750,
-        "label_offset_x": 0.0, "label_offset_y": 0.25,
-        "label_align": "lowerLeft", "label_rotation": "R90",
-    },
-    "bottom": {
-        "extend_x": 0.0, "extend_y": -0.750,
-        "label_offset_x": 0.0, "label_offset_y": -0.25,
-        "label_align": "lowerRight", "label_rotation": "R90",
-    },
-}
+# ── Step 4c: Add Wire + Label (label-based wiring) ──────────
 
 
 def add_wire_labels(
@@ -370,11 +388,13 @@ def add_wire_labels(
     Returns list of net names that were labeled.
     """
     labeled_nets = []
-    cfg = _SIDE_CONFIGS
+    cfg = SIDE_CONFIGS
 
     with client.schematic.edit(lib, tb_cell, mode="a") as sch:
         for pin in pins:
-            net_name = pin.name
+            # Ground pins connect directly to the global ground net
+            pad_type = classify_pin_heuristic(pin)
+            net_name = "gnd!" if pad_type == "ground" else pin.name
             labeled_nets.append(net_name)
             cmd = label_inst_term(
                 "DUT", pin.name, net_name,
@@ -385,11 +405,11 @@ def add_wire_labels(
             sch.add(cmd)
         # Context exit auto-runs schCheck + dbSave
 
-    print(f"[step3c] Added {len(labeled_nets)} labeled wire stubs on DUT pins: OK")
+    print(f"[step4c] Added {len(labeled_nets)} labeled wire stubs on DUT pins: OK")
     return labeled_nets
 
 
-# ── Step 3d: Place Sources & Loads ───────────────────────────
+# ── Step 4d: Place Sources & Loads ───────────────────────────
 
 def _pin_position_in_tb(
     pin: PinInfo, dut_xy: tuple[float, float]
@@ -455,8 +475,8 @@ def place_sources_and_loads(
         placed.append("GND0")
 
         for pin in pins:
-            pad_type = classify_pin(pin)
-            # ground pins need no source — they ARE the reference
+            pad_type = classify_pin_heuristic(pin)
+            # ground pins are already labeled gnd! by add_wire_labels
             if pad_type == "ground":
                 continue
             rule = PAD_RULES.get(pad_type)
@@ -464,15 +484,23 @@ def place_sources_and_loads(
                 continue
             px, py = _pin_position_in_tb(pin, dut_xy)
 
+            has_both = "source" in rule and "load" in rule
+
             for role in ("source", "load"):
                 cfg = rule.get(role)
                 if cfg is None:
                     continue
 
                 inst_name = f"{'SRC' if role == 'source' else 'LOAD'}_{pin.name}"
-                sx, sy = _source_load_position(px, py, pin.side)
+                # Place load further out to avoid overlap with source
+                if has_both and role == "load":
+                    sx, sy = _source_load_position(px, py, pin.side, offset=_LOAD_OFFSET)
+                else:
+                    sx, sy = _source_load_position(px, py, pin.side)
+                # Rotate left/right instances horizontal to avoid vertical overlap
+                inst_rot = "R90" if pin.side in ("left", "right") else "R0"
                 sch.add(inst(cfg["lib"], cfg["cell"], "symbol",
-                             inst_name, sx, sy, "R0"))
+                             inst_name, sx, sy, inst_rot))
                 placed.append(inst_name)
 
                 # Label primary terminal → net = pin.name (connects to DUT)
@@ -490,7 +518,7 @@ def place_sources_and_loads(
 
     # ── Phase 2: set CDF params ───────────────────────────
     for pin in pins:
-        pad_type = classify_pin(pin)
+        pad_type = classify_pin_heuristic(pin)
         if pad_type == "ground":
             continue
         rule = PAD_RULES.get(pad_type)
@@ -515,10 +543,10 @@ def place_sources_and_loads(
             )
             r = client.execute_skill(skill, timeout=30)
             if r.errors:
-                print(f"[step3d] WARNING: CDF params failed for {inst_name}: {r.errors}")
+                print(f"[step4d] WARNING: CDF params failed for {inst_name}: {r.errors}")
 
     n_src = len([p for p in placed if p != "GND0"])
-    print(f"[step3d] Placed 1 global ref + {n_src} source/load instances: OK")
+    print(f"[step4d] Placed 1 global ref + {n_src} source/load instances: OK")
     return placed
 
 
@@ -541,41 +569,49 @@ def run_sim_flow(
 
     run_dir = create_run_dir()
 
+    # Log current skill code snapshot (files may change between runs)
+    for il_file in sorted(_SKILL_DIR.glob("*.il")):
+        log_skill_code(run_dir, il_file)
+
     print(f"\n{'='*60}")
     print(f" Sim Flow: {lib}/{primary_cell}  (VDD={vdd_value}V)")
     print(f" Output:   {run_dir}")
     print(f"{'='*60}\n")
 
-    # Step 1: Export symbol
+    # Step 1: Export symbol (TSG)
     symbol_ok = export_symbol(client, lib, primary_cell)
 
-    # Step 2: Create _tb cellview
+    # Step 2: Redistribute symbol pins (extract → calculate → apply)
+    redistributed = redistribute_symbol(client, lib, primary_cell, run_dir)
+
+    # Step 3: Create _tb cellview
     tb_cell = create_tb_cellview(client, lib, primary_cell)
 
-    # # Step 3a: Place DUT instance
-    # dut_ok = place_dut(client, lib, tb_cell, primary_cell)
+    # Step 4a: Place DUT instance
+    dut_ok = place_dut(client, lib, tb_cell, primary_cell)
 
-    # # Step 3b: Extract pin info
-    # pins = extract_dut_pins(client, lib, primary_cell)
+    # Step 4b: Extract pin info (from redistributed symbol)
+    pins = extract_dut_pins(client, lib, primary_cell)
 
-    # # Step 3c: Add wire labels on DUT pins
-    # labels = add_wire_labels(client, lib, tb_cell, pins) if pins else []
+    # Step 4c: Add wire labels on DUT pins
+    labels = add_wire_labels(client, lib, tb_cell, pins) if pins else []
 
-    # # Step 3d: Place sources & loads based on pin classification
-    # sources = place_sources_and_loads(
-    #     client, lib, tb_cell, pins, vdd_value=vdd_value,
-    # ) if pins else []
+    # Step 4d: Place sources & loads based on pin classification
+    sources = place_sources_and_loads(
+        client, lib, tb_cell, pins, vdd_value=vdd_value,
+    ) if pins else []
 
     result = SimFlowResult(
         lib=lib,
         primary_cell=primary_cell,
         tb_cell=tb_cell,
         symbol_exported=symbol_ok,
+        redistributed=redistributed,
         tb_created=True,
-        dut_placed=False,
-        pins=[],
-        labels_added=[],
-        sources_placed=[],
+        dut_placed=dut_ok,
+        pins=pins,
+        labels_added=labels,
+        sources_placed=sources,
     )
 
     # Save result to timestamped output dir
@@ -587,6 +623,7 @@ def run_sim_flow(
     print(f"{'='*60}")
     print(f"  Output dir:        {run_dir}")
     print(f"  Symbol exported:   {result.symbol_exported}")
+    print(f"  Redistributed:     {result.redistributed}")
     print(f"  TB cellview:       {lib}/{result.tb_cell}/schematic")
     print(f"  DUT placed:        {result.dut_placed}")
     print(f"  Pins extracted:    {len(result.pins)}")
@@ -599,10 +636,10 @@ def run_sim_flow(
     # Pin type breakdown
     types = {}
     for p in result.pins:
-        t = classify_pin(p)
+        t = classify_pin_heuristic(p)
         types[t] = types.get(t, 0) + 1
     print(f"  Pin types:         {dict(sorted(types.items()))}")
-    # # Step 4: ADE assembler + simulation (deferred — ADE permission required)
+    # # Step 5: ADE assembler + simulation (deferred — ADE permission required)
     print(f"\n  Next: ADE assembler + simulation (deferred — ADE permission required)")
     print(f"{'='*60}\n")
 

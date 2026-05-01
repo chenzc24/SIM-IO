@@ -11,26 +11,42 @@ Total network round-trips: 5 (down from 3+N+ceil(N/22)).
 
 from __future__ import annotations
 
+import json
 import sys
-import tempfile
+from dataclasses import asdict
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "virtuoso-bridge-lite" / "src"))
+_SRC_DIR = Path(__file__).resolve().parent
+_SIM_IO = _SRC_DIR.parent
+sys.path.insert(0, str(_SIM_IO.parent / "virtuoso-bridge-lite" / "src"))
+sys.path.insert(0, str(_SRC_DIR))
 
 from virtuoso_bridge import VirtuosoClient
 
+from sim_flow import create_run_dir, log_skill_code
 from symbol_layout_engine import (
     LayoutConfig,
     LayoutEngine,
+    Side,
     generate_apply_skill,
     parse_symbol_info,
 )
 
-_SKILL_DIR = Path(__file__).resolve().parent / "skill_code"
+_SKILL_DIR = _SIM_IO / "skill_code"
 
 
 def run(lib: str, cell: str):
     client = VirtuosoClient.from_env()
+    run_dir = create_run_dir()
+
+    # Log current skill code snapshot
+    for il_file in sorted(_SKILL_DIR.glob("*.il")):
+        log_skill_code(run_dir, il_file)
+
+    print(f"\n{'='*60}")
+    print(f" Symbol Redistribute: {lib}/{cell}")
+    print(f" Output: {run_dir}")
+    print(f"{'='*60}\n")
 
     # ── Step 0: Fresh TSG ─────────────────────────────────────
     print("=== Step 0: Regenerate symbol via TSG ===")
@@ -58,6 +74,9 @@ def run(lib: str, cell: str):
     print(f"  Extracted: {len(info.rects)} rects, {len(info.lines)} lines, "
           f"{len(info.labels)} labels, {len(info.terminals)} terminals")
 
+    # Save raw extraction data
+    (run_dir / "extract_raw.txt").write_text(r.output or "", encoding="utf-8")
+
     # ── Step 2: Calculate layout ──────────────────────────────
     print("\n=== Step 2: Calculate layout ===")
     engine = LayoutEngine(LayoutConfig())
@@ -71,13 +90,26 @@ def run(lib: str, cell: str):
         count = sum(1 for p in result.pins if p.side.value == side_name)
         print(f"  {side_name}: {count} pins")
 
+    # Save layout result as JSON
+    layout_data = {
+        "lib": lib, "cell": cell,
+        "body": {k: v for k, v in asdict(body).items()},
+        "pins": [{k: (v.value if isinstance(v, Side) else v)
+                  for k, v in asdict(p).items()} for p in result.pins],
+    }
+    (run_dir / "layout_result.json").write_text(
+        json.dumps(layout_data, indent=2), encoding="utf-8"
+    )
+
     # ── Step 3: Apply ─────────────────────────────────────────
     print("\n=== Step 3: Apply layout ===")
     skill_code = generate_apply_skill(lib, cell, result, engine.config)
 
-    # Write to temp .il file and upload+load via bridge (T28 proven pattern)
-    apply_il = _SKILL_DIR / "_apply_layout.il"
+    # Save generated .il to run_dir
+    apply_il = run_dir / "apply_layout.il"
     apply_il.write_text(skill_code, encoding="utf-8")
+    print(f"  Saved: {apply_il}")
+
     load_r = client.load_il(str(apply_il), timeout=120)
     if not load_r.ok:
         print(f"  ERROR: {load_r.errors}")
@@ -94,6 +126,7 @@ def run(lib: str, cell: str):
     r = client.execute_skill(f'length({sym}~>shapes)')
     print(f"  Shapes: {r.output}")
 
+    print(f"\n  Output dir: {run_dir}")
     print("\n=== DONE ===")
 
 
