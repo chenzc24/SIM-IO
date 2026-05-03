@@ -86,7 +86,6 @@ def label_instance_term(
     term_name: str,
     net_name: str,
     *,
-    stub_direction: str | None = None,
     extension_length: float = 0.25,
     justification: str = "centerCenter",
     rotation: str = "R0",
@@ -100,7 +99,6 @@ def label_instance_term(
     return batch_ops(lib, cell, [
         label_term(
             instance_name, term_name, net_name,
-            stub_direction=stub_direction,
             extension_length=extension_length,
             justification=justification,
             rotation=rotation,
@@ -117,14 +115,13 @@ def label_instance_terms(
 
     labels: list of dicts with keys:
         "instance", "term", "net"  (required)
-        "stub_direction", "extension_length", "justification", "rotation"  (optional)
+        "extension_length", "justification", "rotation"  (optional)
     Opens CV once -> labels all terminals -> schCheck -> dbSave once.
     """
     ops = []
     for lbl in labels:
         ops.append(label_term(
             lbl["instance"], lbl["term"], lbl["net"],
-            stub_direction=lbl.get("stub_direction"),
             extension_length=lbl.get("extension_length", 0.25),
             justification=lbl.get("justification", "centerCenter"),
             rotation=lbl.get("rotation", "R0"),
@@ -154,7 +151,6 @@ def place_and_label(
     for lbl in labels:
         ops.append(label_term(
             lbl["instance"], lbl["term"], lbl["net"],
-            stub_direction=lbl.get("stub_direction"),
             extension_length=lbl.get("extension_length", 0.25),
             justification=lbl.get("justification", "centerCenter"),
             rotation=lbl.get("rotation", "R0"),

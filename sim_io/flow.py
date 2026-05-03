@@ -436,7 +436,6 @@ def add_wire_labels(
             "DUT", pin.name, net_name,
             rotation=cfg[pin.side]["label_rotation"],
             justification=cfg[pin.side]["label_align"],
-            stub_direction=pin.side,
         ))
 
     batch_ops(lib, tb_cell, ops)
