@@ -69,6 +69,8 @@ class TermData:
     direction: str
     cx: float
     cy: float
+    fig_layer: str = "pin"
+    fig_purpose: str = "drawing"
 
 
 @dataclass
@@ -83,14 +85,14 @@ class SymbolInfo:
 
 @dataclass
 class LayoutConfig:
-    pin_margin: float = 0.075
-    body_margin: float = 1.25
-    pin_pitch: float = 0.5
+    pin_pitch: float = 1.0
     wire_length: float = 0.375
     end_margin: float = 2.0
     label_inset: float = 0.125
+    core_label_inset: float = 0.3
     center_x: float = 2.5
     center_y: float = -0.5
+    body_width: float = 2.5
     min_body_half: float = 0.125
 
 
@@ -103,27 +105,24 @@ class PinLayout:
     side: Side
     new_cx: float
     new_cy: float
-    wire_x1: float
-    wire_y1: float
-    wire_x2: float
-    wire_y2: float
-    label_x: float
-    label_y: float
+    wire_x1: float = 0.0
+    wire_y1: float = 0.0
+    wire_x2: float = 0.0
+    wire_y2: float = 0.0
+    label_x: float = 0.0
+    label_y: float = 0.0
     label_orig_x: float = 0.0
     label_orig_y: float = 0.0
     is_core: bool = False
+    needs_duplicate_fig: bool = False
 
 
 @dataclass(frozen=True)
 class BodyLayout:
-    outer_left: float
-    outer_bottom: float
-    outer_right: float
-    outer_top: float
-    inner_left: float
-    inner_bottom: float
-    inner_right: float
-    inner_top: float
+    left: float
+    bottom: float
+    right: float
+    top: float
 
 
 @dataclass
@@ -175,11 +174,14 @@ def parse_symbol_info(raw_output: str) -> SymbolInfo:
                     text=parts[3],
                     x=float(parts[4]), y=float(parts[5]),
                 ))
-            elif kind == "TERM" and len(parts) == 7:
+            elif kind == "TERM" and len(parts) >= 7:
+                fig_layer = parts[7] if len(parts) > 7 else "pin"
+                fig_purpose = parts[8] if len(parts) > 8 else "drawing"
                 info.terminals.append(TermData(
                     index=int(parts[1]), pin_index=int(parts[2]),
                     name=parts[3], direction=parts[4],
                     cx=float(parts[5]), cy=float(parts[6]),
+                    fig_layer=fig_layer, fig_purpose=fig_purpose,
                 ))
         except (ValueError, IndexError):
             continue
@@ -266,35 +268,24 @@ class LayoutEngine:
 
     def _calc_body(self, classified: dict[Side, list[TermData]]) -> BodyLayout:
         cfg = self.config
-
         _CORE_SFX = "_CORE"
-        n_vert = max(
-            sum(1 for t in classified.get(Side.LEFT, []) if not t.name.endswith(_CORE_SFX)),
-            sum(1 for t in classified.get(Side.RIGHT, []) if not t.name.endswith(_CORE_SFX)),
-        )
-        n_horiz = max(
-            sum(1 for t in classified.get(Side.TOP, []) if not t.name.endswith(_CORE_SFX)),
-            sum(1 for t in classified.get(Side.BOTTOM, []) if not t.name.endswith(_CORE_SFX)),
+
+        n_left = sum(
+            1 for side in Side
+            for t in classified.get(side, [])
+            if not t.name.endswith(_CORE_SFX)
         )
 
-        vert_span = (n_vert - 1) * cfg.pin_pitch if n_vert > 1 else 0.0
+        vert_span = (n_left - 1) * cfg.pin_pitch if n_left > 1 else 0.0
         body_height = max(vert_span + 2 * cfg.end_margin, 2 * cfg.min_body_half)
+        body_width = cfg.body_width
 
-        horiz_span = (n_horiz - 1) * cfg.pin_pitch if n_horiz > 1 else 0.0
-        body_width = max(horiz_span + 2 * cfg.end_margin, 2 * cfg.min_body_half)
+        L = cfg.center_x - body_width / 2
+        R = cfg.center_x + body_width / 2
+        B = cfg.center_y - body_height / 2
+        T = cfg.center_y + body_height / 2
 
-        oL = cfg.center_x - body_width / 2
-        oR = cfg.center_x + body_width / 2
-        oB = cfg.center_y - body_height / 2
-        oT = cfg.center_y + body_height / 2
-
-        return BodyLayout(
-            outer_left=oL, outer_bottom=oB, outer_right=oR, outer_top=oT,
-            inner_left=oL + cfg.body_margin,
-            inner_bottom=oB + cfg.body_margin,
-            inner_right=oR - cfg.body_margin,
-            inner_top=oT - cfg.body_margin,
-        )
+        return BodyLayout(left=L, bottom=B, right=R, top=T)
 
     # ── Calculate pin layouts (position + wire + label) ───────
 
@@ -305,17 +296,44 @@ class LayoutEngine:
         cfg = self.config
         _CORE_SFX = "_CORE"
 
-        # Separate CORE and non-CORE terminals
-        non_core: dict[Side, list[TermData]] = {s: [] for s in Side}
-        core_with_side: list[tuple[TermData, Side]] = []
+        # ── Pass 0: build ordered list of non-CORE pins for left side ──
+        left_group = sorted(
+            [t for t in classified.get(Side.LEFT, []) if not t.name.endswith(_CORE_SFX)],
+            key=lambda t: -t.cy,
+        )
+        right_group = sorted(
+            [t for t in classified.get(Side.RIGHT, []) if not t.name.endswith(_CORE_SFX)],
+            key=lambda t: -t.cy,
+        )
+        top_group = sorted(
+            [t for t in classified.get(Side.TOP, []) if not t.name.endswith(_CORE_SFX)],
+            key=lambda t: t.cx,
+        )
+        bottom_group = sorted(
+            [t for t in classified.get(Side.BOTTOM, []) if not t.name.endswith(_CORE_SFX)],
+            key=lambda t: t.cx,
+        )
+
+        ordered_left = left_group + right_group + top_group + bottom_group
+
+        # De-duplicate by name (multi-pin terminals like VSS appear twice)
+        seen_names: set[str] = set()
+        unique_left: list[TermData] = []
+        for t in ordered_left:
+            if t.name not in seen_names:
+                seen_names.add(t.name)
+                unique_left.append(t)
+        ordered_left = unique_left
+
+        # Build CORE terminal lookup: base_name -> TermData
+        core_terms: dict[str, TermData] = {}
         for side in Side:
             for t in classified.get(side, []):
                 if t.name.endswith(_CORE_SFX):
-                    core_with_side.append((t, side))
-                else:
-                    non_core[side].append(t)
+                    base = t.name[:-len(_CORE_SFX)]
+                    core_terms[base] = t
 
-        # Label consumption tracker — each label matched to at most one pin
+        # Label consumption tracker
         consumed: set[tuple[str, float, float]] = set()
 
         def claim_label(name: str, pin_cx: float, pin_cy: float) -> tuple[float, float]:
@@ -329,88 +347,83 @@ class LayoutEngine:
             consumed.add((name, best[0], best[1]))
             return best
 
-        # Pass 1: distribute non-CORE pins evenly on outer rect
+        # ── Pass 1: non-CORE pins on LEFT side ──
         layouts: list[PinLayout] = []
-        edge_pos: dict[str, tuple[float, float, Side]] = {}
+        left_y_map: dict[str, float] = {}
+        n = len(ordered_left)
+        pin_span = (n - 1) * cfg.pin_pitch if n > 1 else 0.0
 
-        for side in Side:
-            terms = non_core[side]
-            n = len(terms)
-            if n == 0:
-                continue
-            pin_span = (n - 1) * cfg.pin_pitch if n > 1 else 0.0
+        for i, term in enumerate(ordered_left):
+            frac = i / (n - 1) if n > 1 else 0.5
+            cy = body.top - cfg.end_margin - frac * pin_span
 
-            for i, term in enumerate(terms):
-                frac = i / (n - 1) if n > 1 else 0.5
-                if side in (Side.LEFT, Side.RIGHT):
-                    cy = body.outer_top - cfg.end_margin - frac * pin_span
-                    edge_pos[term.name] = (0.0, cy, side)
-                else:
-                    cx = body.outer_left + cfg.end_margin + frac * pin_span
-                    edge_pos[term.name] = (cx, 0.0, side)
+            # Pin figure outside body on left
+            pin_cx = body.left - cfg.wire_length
+            pin_cy = cy
 
-                # Outer layout: wire from outer edge outward, pin at far end, label inside
-                if side == Side.LEFT:
-                    wx1, wy1 = body.outer_left, cy
-                    wx2, wy2 = body.outer_left - cfg.wire_length, cy
-                    pin_cx, pin_cy = wx2, cy
-                    lx, ly = body.outer_left + cfg.label_inset, cy
-                elif side == Side.RIGHT:
-                    wx1, wy1 = body.outer_right, cy
-                    wx2, wy2 = body.outer_right + cfg.wire_length, cy
-                    pin_cx, pin_cy = wx2, cy
-                    lx, ly = body.outer_right - cfg.label_inset, cy
-                elif side == Side.TOP:
-                    wx1, wy1 = cx, body.outer_top
-                    wx2, wy2 = cx, body.outer_top + cfg.wire_length
-                    pin_cx, pin_cy = cx, wy2
-                    lx, ly = cx, body.outer_top - cfg.label_inset
-                else:  # BOTTOM
-                    wx1, wy1 = cx, body.outer_bottom
-                    wx2, wy2 = cx, body.outer_bottom - cfg.wire_length
-                    pin_cx, pin_cy = cx, wy2
-                    lx, ly = cx, body.outer_bottom + cfg.label_inset
+            # Wire stub from body edge to pin
+            wx1, wy1 = body.left, cy
+            wx2, wy2 = body.left - cfg.wire_length, cy
 
-                orig_lx, orig_ly = claim_label(term.name, term.cx, term.cy)
+            # Label inside body
+            lx, ly = body.left + cfg.label_inset, cy
+
+            left_y_map[term.name] = cy
+            orig_lx, orig_ly = claim_label(term.name, term.cx, term.cy)
+
+            layouts.append(PinLayout(
+                term_index=term.index, pin_index=term.pin_index,
+                name=term.name, direction=term.direction, side=Side.LEFT,
+                new_cx=pin_cx, new_cy=pin_cy,
+                wire_x1=wx1, wire_y1=wy1,
+                wire_x2=wx2, wire_y2=wy2,
+                label_x=lx, label_y=ly,
+                label_orig_x=orig_lx, label_orig_y=orig_ly,
+            ))
+
+        # ── Pass 2: CORE + duplicate pins on RIGHT side ──
+        for term in ordered_left:
+            cy = left_y_map[term.name]
+            base_name = term.name
+
+            # Pin figure outside body on right
+            pin_cx = body.right + cfg.wire_length
+            pin_cy = cy
+
+            # Wire stub from body edge to pin
+            wx1, wy1 = body.right, cy
+            wx2, wy2 = body.right + cfg.wire_length, cy
+
+            # Label inside body near right edge
+            lx, ly = body.right - cfg.core_label_inset, cy
+
+            if base_name in core_terms:
+                # Existing CORE terminal — move its figure
+                ct = core_terms[base_name]
+                orig_lx, orig_ly = claim_label(ct.name, ct.cx, ct.cy)
 
                 layouts.append(PinLayout(
-                    term_index=term.index, pin_index=term.pin_index,
-                    name=term.name, direction=term.direction, side=side,
+                    term_index=ct.index, pin_index=ct.pin_index,
+                    name=ct.name, direction=ct.direction, side=Side.RIGHT,
                     new_cx=pin_cx, new_cy=pin_cy,
                     wire_x1=wx1, wire_y1=wy1,
                     wire_x2=wx2, wire_y2=wy2,
                     label_x=lx, label_y=ly,
                     label_orig_x=orig_lx, label_orig_y=orig_ly,
+                    is_core=True,
                 ))
-
-        # Pass 2: place CORE pins on inner rect at their base signal's position
-        for term, orig_side in core_with_side:
-            base_name = term.name[:-len(_CORE_SFX)]
-            base_info = edge_pos.get(base_name)
-
-            if base_info:
-                bx, by, base_side = base_info
-                if base_side in (Side.LEFT, Side.RIGHT):
-                    inner_cx = body.inner_left if base_side == Side.LEFT else body.inner_right
-                    inner_cy = by
-                else:
-                    inner_cx = bx
-                    inner_cy = body.inner_top if base_side == Side.TOP else body.inner_bottom
             else:
-                inner_cx, inner_cy = body.inner_left, body.outer_top
-
-            orig_lx, orig_ly = claim_label(term.name, term.cx, term.cy)
-
-            layouts.append(PinLayout(
-                term_index=term.index, pin_index=term.pin_index,
-                name=term.name, direction=term.direction, side=orig_side,
-                new_cx=inner_cx, new_cy=inner_cy,
-                wire_x1=0.0, wire_y1=0.0,
-                wire_x2=0.0, wire_y2=0.0,
-                label_x=0.0, label_y=0.0,
-                label_orig_x=orig_lx, label_orig_y=orig_ly,
-                is_core=True,
-            ))
+                # No CORE terminal — create duplicate pin figure
+                layouts.append(PinLayout(
+                    term_index=term.index, pin_index=term.pin_index,
+                    name=term.name, direction=term.direction, side=Side.RIGHT,
+                    new_cx=pin_cx, new_cy=pin_cy,
+                    wire_x1=wx1, wire_y1=wy1,
+                    wire_x2=wx2, wire_y2=wy2,
+                    label_x=lx, label_y=ly,
+                    label_orig_x=0.0, label_orig_y=0.0,
+                    needs_duplicate_fig=True,
+                ))
 
         return layouts
 
@@ -424,9 +437,10 @@ def generate_apply_skill(
     """Generate ONE SKILL script that applies the entire layout.
 
     Each statement on its own line (T28 proven pattern for load() compatibility).
-    Handles two pin types:
-      - *_CORE: pin moved to inner rect at base signal position; label deleted, no wire
-      - non-CORE: pin+wire+label on outer rect (CORE signals excluded from distribution)
+    Handles three pin categories:
+      - Left non-CORE: move pin figure + create wire + move label
+      - Right CORE: move pin figure + create wire + move label (not deleted)
+      - Right duplicate: dbCreateRect + dbAddFigToPin + create wire + dbCreateLabel
     """
     cfg = config or LayoutConfig()
     body = result.body
@@ -435,7 +449,7 @@ def generate_apply_skill(
     lines: list[str] = []
 
     # Open cellview
-    lines.append('let((cv term pin fig bb w h lbl shapes)')
+    lines.append('let((cv term pin fig newFig bb w h lbl shapes)')
     lines.append(f'  cv = dbOpenCellViewByType("{lib}" "{cell}" "symbol" "schematicSymbol" "a")')
     lines.append(f'  unless(cv error("APPLY-LAYOUT: cannot open cellview"))')
 
@@ -450,17 +464,11 @@ def generate_apply_skill(
     lines.append('    s~>objType == "line" && s~>layerName == "device" && s~>purpose == "drawing")')
     lines.append('  foreach(s shapes dbDeleteObject(s))')
 
-    # Create new outer body rect (device/drawing — same format as inner)
+    # Create single body rect (device/drawing)
     lines.append(
         f'  dbCreateRect(cv list("device" "drawing")'
-        f' list(list({body.outer_left:g} {body.outer_bottom:g})'
-        f' list({body.outer_right:g} {body.outer_top:g})))')
-
-    # Create new inner body rect (device/drawing)
-    lines.append(
-        f'  dbCreateRect(cv list("device" "drawing")'
-        f' list(list({body.inner_left:g} {body.inner_bottom:g})'
-        f' list({body.inner_right:g} {body.inner_top:g})))')
+        f' list(list({body.left:g} {body.bottom:g})'
+        f' list({body.right:g} {body.top:g})))')
 
     # Process each pin
     for pin in pins:
@@ -471,49 +479,107 @@ def generate_apply_skill(
         name = pin.name
         olx, oly = pin.label_orig_x, pin.label_orig_y
 
-        # Move pin figure (terminal index + pin sub-index for duplicate safety)
-        lines.append(f'  term = nth({tidx} cv~>terminals)')
-        lines.append(f'  when(term')
-        lines.append(f'    pin = nth({pidx} term~>pins)')
-        lines.append(f'    fig = car(pin~>figs)')
-        lines.append(f'    bb = fig~>bBox')
-        lines.append(f'    w = car(cadr(bb)) - car(car(bb))')
-        lines.append(f'    h = cadr(cadr(bb)) - cadr(car(bb))')
-        lines.append(
-            f'    fig~>bBox = list('
-            f'list({ncx:g} - w/2.0 {ncy:g} - h/2.0)'
-            f' list({ncx:g} + w/2.0 {ncy:g} + h/2.0))')
-        lines.append(f'  )')
-
-        if pin.is_core:
-            # CORE: delete label matched by original position
+        if pin.needs_duplicate_fig:
+            # ── Right-side duplicate: create new pin figure + wire + label ──
+            # Create new pin rect and attach to existing pin via dbAddFigToPin
+            lines.append(f'  term = nth({tidx} cv~>terminals)')
+            lines.append(f'  when(term')
+            lines.append(f'    pin = car(term~>pins)')
+            lines.append(f'    fig = car(pin~>figs)')
+            lines.append(f'    bb = fig~>bBox')
+            lines.append(f'    w = car(cadr(bb)) - car(car(bb))')
+            lines.append(f'    h = cadr(cadr(bb)) - cadr(car(bb))')
             lines.append(
-                f'  lbl = car(setof(s cv~>shapes'
-                f' s~>objType == "label" && s~>theLabel == "{name}"'
-                f' && abs(car(s~>xy) - {olx:g}) < 0.01'
-                f' && abs(cadr(s~>xy) - {oly:g}) < 0.01))')
-            lines.append(f'  when(lbl dbDeleteObject(lbl))')
-        else:
-            # Non-CORE: create wire + move label matched by original position
+                f'    newFig = dbCreateRect(cv list("pin" "drawing")'
+                f' list(list({ncx:g} - w/2.0 {ncy:g} - h/2.0)'
+                f' list({ncx:g} + w/2.0 {ncy:g} + h/2.0)))')
+            lines.append(f'    dbAddFigToPin(pin newFig)')
+            lines.append(f'  )')
+            # Wire stub
             wx1, wy1 = pin.wire_x1, pin.wire_y1
             wx2, wy2 = pin.wire_x2, pin.wire_y2
-            lx, ly = pin.label_x, pin.label_y
-
             lines.append(
                 f'  dbCreateLine(cv list("device" "drawing")'
                 f' list(list({wx1:g} {wy1:g}) list({wx2:g} {wy2:g})))')
+            # New label (centered)
+            lx, ly = pin.label_x, pin.label_y
+            lines.append(
+                f'  dbCreateLabel(cv list("pin" "label")'
+                f' list({lx:g} {ly:g}) "{name}"'
+                f' "lowerCenter" "R0" "stick" 0.0625)')
 
+        elif pin.is_core:
+            # ── Right-side CORE: move pin figure + create wire + move label ──
+            lines.append(f'  term = nth({tidx} cv~>terminals)')
+            lines.append(f'  when(term')
+            # Move ALL pin figures for this terminal (handles multi-pin terminals)
+            lines.append(f'    foreach(p term~>pins')
+            lines.append(f'      fig = car(p~>figs)')
+            lines.append(f'      when(fig')
+            lines.append(f'        bb = fig~>bBox')
+            lines.append(f'        w = car(cadr(bb)) - car(car(bb))')
+            lines.append(f'        h = cadr(cadr(bb)) - cadr(car(bb))')
+            lines.append(
+                f'        fig~>bBox = list('
+                f'list({ncx:g} - w/2.0 {ncy:g} - h/2.0)'
+                f' list({ncx:g} + w/2.0 {ncy:g} + h/2.0))')
+            lines.append(f'      )')
+            lines.append(f'    )')
+            lines.append(f'  )')
+            # Wire stub
+            wx1, wy1 = pin.wire_x1, pin.wire_y1
+            wx2, wy2 = pin.wire_x2, pin.wire_y2
+            lines.append(
+                f'  dbCreateLine(cv list("device" "drawing")'
+                f' list(list({wx1:g} {wy1:g}) list({wx2:g} {wy2:g})))')
+            # Move label + fix justification for right side
+            lx, ly = pin.label_x, pin.label_y
             lines.append(
                 f'  lbl = car(setof(s cv~>shapes'
                 f' s~>objType == "label" && s~>theLabel == "{name}"'
                 f' && abs(car(s~>xy) - {olx:g}) < 0.01'
                 f' && abs(cadr(s~>xy) - {oly:g}) < 0.01))')
-            lines.append(f'  when(lbl lbl~>xy = list({lx:g} {ly:g}))')
+            lines.append(f'  when(lbl lbl~>xy = list({lx:g} {ly:g}) lbl~>justify = "lowerCenter")')
+
+        else:
+            # ── Left-side non-CORE: move pin figure + create wire + move label ──
+            lines.append(f'  term = nth({tidx} cv~>terminals)')
+            lines.append(f'  when(term')
+            # Move ALL pin figures for this terminal
+            lines.append(f'    foreach(p term~>pins')
+            lines.append(f'      fig = car(p~>figs)')
+            lines.append(f'      when(fig')
+            lines.append(f'        bb = fig~>bBox')
+            lines.append(f'        w = car(cadr(bb)) - car(car(bb))')
+            lines.append(f'        h = cadr(cadr(bb)) - cadr(car(bb))')
+            lines.append(
+                f'        fig~>bBox = list('
+                f'list({ncx:g} - w/2.0 {ncy:g} - h/2.0)'
+                f' list({ncx:g} + w/2.0 {ncy:g} + h/2.0))')
+            lines.append(f'      )')
+            lines.append(f'    )')
+            lines.append(f'  )')
+            # Wire stub
+            wx1, wy1 = pin.wire_x1, pin.wire_y1
+            wx2, wy2 = pin.wire_x2, pin.wire_y2
+            lines.append(
+                f'  dbCreateLine(cv list("device" "drawing")'
+                f' list(list({wx1:g} {wy1:g}) list({wx2:g} {wy2:g})))')
+            # Move label
+            lx, ly = pin.label_x, pin.label_y
+            lines.append(
+                f'  lbl = car(setof(s cv~>shapes'
+                f' s~>objType == "label" && s~>theLabel == "{name}"'
+                f' && abs(car(s~>xy) - {olx:g}) < 0.01'
+                f' && abs(cadr(s~>xy) - {oly:g}) < 0.01))')
+            lines.append(f'  when(lbl lbl~>xy = list({lx:g} {ly:g}) lbl~>justify = "lowerCenter")')
 
     # Save + return
     lines.append(f'  dbSave(cv)')
+    n_left = sum(1 for p in pins if p.side == Side.LEFT)
     n_core = sum(1 for p in pins if p.is_core)
-    lines.append(f'  printf("APPLY-LAYOUT: OK  pins={len(pins)}  core={n_core}")')
+    n_dup = sum(1 for p in pins if p.needs_duplicate_fig)
+    lines.append(f'  printf("APPLY-LAYOUT: OK  left={n_left}  core={n_core}  dup={n_dup}")')
     lines.append(f'  t')
     lines.append(f')')
 

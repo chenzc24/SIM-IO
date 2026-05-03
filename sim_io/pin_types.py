@@ -175,22 +175,22 @@ SIDE_CONFIGS = {
     "right": {
         "extend_x": 0.750, "extend_y": 0.0,
         "label_offset_x": 0.25, "label_offset_y": 0.0,
-        "label_align": "lowerLeft", "label_rotation": "R0",
+        "label_align": "lowerCenter", "label_rotation": "R0",
     },
     "left": {
         "extend_x": -0.750, "extend_y": 0.0,
         "label_offset_x": -0.25, "label_offset_y": 0.0,
-        "label_align": "lowerRight", "label_rotation": "R0",
+        "label_align": "lowerCenter", "label_rotation": "R0",
     },
     "top": {
         "extend_x": 0.0, "extend_y": 0.750,
         "label_offset_x": 0.0, "label_offset_y": 0.25,
-        "label_align": "lowerLeft", "label_rotation": "R90",
+        "label_align": "lowerCenter", "label_rotation": "R0",
     },
     "bottom": {
         "extend_x": 0.0, "extend_y": -0.750,
         "label_offset_x": 0.0, "label_offset_y": -0.25,
-        "label_align": "lowerRight", "label_rotation": "R90",
+        "label_align": "lowerCenter", "label_rotation": "R0",
     },
 }
 

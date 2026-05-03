@@ -35,6 +35,7 @@ class SiteConfig:
     cds_lib: str
     ic_root: str
     pdk_spectre_include: str
+    pdk_io_spectre_include: str = ""
     lm_license_file: str = ""
     cds_lic_file: str = ""
 
@@ -63,6 +64,7 @@ class SiteConfig:
             cds_lib=cds_lib,
             ic_root=ic_root,
             pdk_spectre_include=os.getenv("SIM_PDK_SPECTRE_INCLUDE", ""),
+            pdk_io_spectre_include=os.getenv("SIM_PDK_IO_SPECTRE_INCLUDE", ""),
             lm_license_file=os.getenv("SIM_LM_LICENSE_FILE", ""),
             cds_lic_file=os.getenv("SIM_CDS_LIC_FILE", ""),
         )

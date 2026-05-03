@@ -10,7 +10,7 @@
  *    RECT|layer|purpose|L|B|R|T
  *    LINE|layer|purpose|x1|y1|x2|y2
  *    LABEL|layer|purpose|text|x|y
- *    TERM|index|name|direction|pinCx|pinCy
+ *    TERM|index|pin_index|name|direction|cx|cy|layer|purpose
  *============================================================*/
 
 procedure( extractSymbolInfo(libName cellName)
@@ -68,8 +68,9 @@ procedure( extractSymbolInfo(libName cellName)
                             bb = fig~>bBox
                             px = (car(car(bb)) + car(cadr(bb))) / 2.0
                             py = (cadr(car(bb)) + cadr(cadr(bb))) / 2.0
-                            out = strcat(out sprintf(nil "TERM|%d|%d|%s|%s|%g|%g\n"
-                                ti pi trm~>name trm~>direction px py))
+                            out = strcat(out sprintf(nil "TERM|%d|%d|%s|%s|%g|%g|%s|%s\n"
+                                ti pi trm~>name trm~>direction px py
+                                fig~>layerName fig~>purpose))
                         )
                         pi = pi + 1
                     )

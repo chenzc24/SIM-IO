@@ -182,7 +182,7 @@ def redistribute_symbol(
     cell: str,
     run_dir: Path,
 ) -> bool:
-    """Redistribute symbol pins evenly on 4 sides.
+    """Redistribute symbol pins on 2 sides (left=outer, right=CORE/duplicate).
 
     Sub-steps:
       2a. Regenerate symbol via TSG (fresh start)
@@ -228,7 +228,7 @@ def redistribute_symbol(
     engine = LayoutEngine(LayoutConfig())
     result = engine.redesign(info)
     body = result.body
-    for side_name in ["left", "right", "top", "bottom"]:
+    for side_name in ["left", "right"]:
         count = sum(1 for p in result.pins if p.side.value == side_name)
         print(f"[step2c] {side_name}: {count} pins")
 
@@ -417,6 +417,8 @@ def add_wire_labels(
     Label-based wiring: same net name on DUT pin and source pin
     means Virtuoso auto-connects them.
 
+    For 2-side (left/right) layout, stub_direction forces horizontal wires.
+
     Returns list of net names that were labeled.
     """
     labeled_nets = []
@@ -433,6 +435,7 @@ def add_wire_labels(
                 cv_expr="cv",
                 rotation=cfg[pin.side]["label_rotation"],
                 justification=cfg[pin.side]["label_align"],
+                stub_direction=pin.side,
             )
             sch.add(cmd)
         # Context exit auto-runs schCheck + dbSave
@@ -502,8 +505,11 @@ def place_sources_and_loads(
 
     # ── Phase 1: place instances + labels ─────────────────
     with client.schematic.edit(lib, tb_cell, mode="a") as sch:
-        # Global gnd symbol for visual ground reference
-        sch.add(inst("analogLib", "gnd", "symbol", "GND0", -1.5, -3.0, "R0"))
+        # Global gnd symbol — place below-left, clear of source/load instances
+        min_pin_y = min((p.y for p in pins), default=-5.0)
+        gnd_x = dut_xy[0] - _LOAD_OFFSET - 2.0
+        gnd_y = dut_xy[1] + min_pin_y - 3.0
+        sch.add(inst("analogLib", "gnd", "symbol", "GND0", gnd_x, gnd_y, "R0"))
         placed.append("GND0")
 
         for pin in pins:
@@ -538,13 +544,13 @@ def place_sources_and_loads(
                 # Label primary terminal → net = pin.name (connects to DUT)
                 sch.add(label_inst_term(
                     inst_name, cfg["term"], pin.name,
-                    justification="centerCenter", rotation="R0",
+                    justification="lowerCenter", rotation="R0",
                 ))
 
-                # Label reference terminal → ref_net (gnd!)
+                # Label reference terminal → GND
                 sch.add(label_inst_term(
-                    inst_name, cfg["ref_term"], ref_net,
-                    justification="centerCenter", rotation="R0",
+                    inst_name, cfg["ref_term"], "GND",
+                    justification="lowerCenter", rotation="R0",
                 ))
         # schCheck + dbSave on exit
 
@@ -590,14 +596,16 @@ def run_sim_flow(
     *,
     vdd_value: float = 1.8,
     run_sim: bool = False,
+    sim_mode: str = "spectre",
     spectre_mode: str = "spectre",
     client: Optional[VirtuosoClient] = None,
     user_intent: str = "",
 ) -> SimFlowResult:
-    """Run the full simulation build-up flow (Steps 1-4) and optionally run spectre.
+    """Run the full simulation build-up flow (Steps 1-4) and optionally simulate.
 
-    When ``run_sim=True``, also executes Steps 5a-5d:
-      netlist export → deck build → spectre run → result verification.
+    When ``run_sim=True``, also executes simulation:
+      - ``sim_mode="spectre"``: si netlist → deck build → CLI Spectre → verify
+      - ``sim_mode="maestro"``: Maestro test setup → background simulation → read results
 
     Simulation config is resolved in this priority order:
       1. run_dir/sim_config.json (LLM-generated)
@@ -657,26 +665,75 @@ def run_sim_flow(
     sim_run_ok = None
     sim_verdict = None
     if run_sim and pins:
-        from sim_io.sim.run import run_sim_run
-        from sim_io.sim.verify import verify_results
-        from sim_io.site_config import SiteConfig
-        from sim_io.sim.config import SimDeckConfig
+        if sim_mode == "maestro":
+            # ── Maestro path ──
+            from sim_io.maestro import build_maestro_setup, run_maestro_sim
+            from sim_io.site_config import SiteConfig
+            from sim_io.sim.config import resolve_sim_config
 
-        site = SiteConfig.from_env()
-        sim_result = run_sim_run(
-            lib, tb_cell, pins, run_dir,
-            site=site,
-            client=client,
-            spectre_mode=spectre_mode,
-            user_intent=user_intent,
-            vdd_value=vdd_value,
-        )
-        sim_run_ok = sim_result.spectre_ok
+            site = SiteConfig.from_env()
+            deck_config = resolve_sim_config(
+                run_dir=run_dir, lib=lib, cell=tb_cell,
+                vdd_value=vdd_value, user_intent=user_intent,
+            )
 
-        if sim_result.measurements:
-            report = verify_results(sim_result.measurements, vdd=vdd_value, cell=tb_cell)
-            sim_verdict = report.verdict
-            report.save(run_dir / "verify.json")
+            # Append IO pad model include if available in site config.
+            # TSMC28 IO pad cells (tphn28hpcpgv18) need their subcircuit
+            # definitions included separately from the core model file.
+            if site.pdk_io_spectre_include:
+                from sim_io.sim.config import ModelInclude
+                deck_config.model_includes.append(
+                    ModelInclude(path=site.pdk_io_spectre_include, section="")
+                )
+                print(f"[maestro-flow] Added IO model include: "
+                      f"{site.pdk_io_spectre_include}")
+
+            # Step 5a: Build Maestro test setup from SimDeckConfig
+            build_maestro_setup(
+                client, lib, tb_cell, deck_config,
+                pins=pins,
+                auto_close=True,
+            )
+
+            # Step 5b: Run simulation in background mode
+            # Signal paths are top-level nets (label-based wiring),
+            # NOT /DUT/X (which is the Spectre instance-terminal path)
+            wave_signals = [f"/{p.name}" for p in pins
+                           if _classify_pin(p) not in ("ground", "no_connect")]
+            mae_result = run_maestro_sim(
+                client, lib, tb_cell,
+                test_name=f"{tb_cell}_test",
+                timeout=600,
+                export_waves=True,
+                wave_signals=wave_signals,
+                run_dir=run_dir,
+            )
+            sim_run_ok = mae_result.sim_ok
+            if mae_result.overall_spec:
+                sim_verdict = mae_result.overall_spec
+
+        else:
+            # ── Standalone Spectre path (original) ──
+            from sim_io.sim.run import run_sim_run
+            from sim_io.sim.verify import verify_results
+            from sim_io.site_config import SiteConfig
+            from sim_io.sim.config import SimDeckConfig
+
+            site = SiteConfig.from_env()
+            sim_result = run_sim_run(
+                lib, tb_cell, pins, run_dir,
+                site=site,
+                client=client,
+                spectre_mode=spectre_mode,
+                user_intent=user_intent,
+                vdd_value=vdd_value,
+            )
+            sim_run_ok = sim_result.spectre_ok
+
+            if sim_result.measurements:
+                report = verify_results(sim_result.measurements, vdd=vdd_value, cell=tb_cell)
+                sim_verdict = report.verdict
+                report.save(run_dir / "verify.json")
 
     result = SimFlowResult(
         lib=lib,
@@ -710,8 +767,6 @@ def run_sim_flow(
     print(f"  Sources placed:    {len(result.sources_placed)}")
     print(f"  Left pins:         {sum(1 for p in result.pins if p.side == 'left')}")
     print(f"  Right pins:        {sum(1 for p in result.pins if p.side == 'right')}")
-    print(f"  Top pins:          {sum(1 for p in result.pins if p.side == 'top')}")
-    print(f"  Bottom pins:       {sum(1 for p in result.pins if p.side == 'bottom')}")
     # Pin type breakdown
     types = {}
     for p in result.pins:
@@ -719,7 +774,7 @@ def run_sim_flow(
         types[t] = types.get(t, 0) + 1
     print(f"  Pin types:         {dict(sorted(types.items()))}")
     if sim_run_ok is not None:
-        print(f"  Spectre run:       {'OK' if sim_run_ok else 'FAILED'}")
+        print(f"  Sim run:           {'OK' if sim_run_ok else 'FAILED'} ({sim_mode})")
     if sim_verdict is not None:
         print(f"  Verify verdict:    {sim_verdict}")
     print(f"{'='*60}\n")
@@ -729,10 +784,14 @@ def run_sim_flow(
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print(f"Usage: python sim_flow.py <lib> <primary_cell> [vdd_value]")
+        print(f"Usage: python sim_flow.py <lib> <primary_cell> [vdd_value] [sim_mode]")
+        print(f"  sim_mode: spectre (default) | maestro")
         print(f"Example: python sim_flow.py LLM_Layout_Design_Lab IO_RING_12x12")
-        print(f"Example: python sim_flow.py LLM_Layout_Design_Lab IO_RING_12x12 3.3")
+        print(f"Example: python sim_flow.py LLM_Layout_Design_Lab IO_RING_12x12 3.3 maestro")
         sys.exit(1)
 
     vdd = float(sys.argv[3]) if len(sys.argv) > 3 else 1.8
-    run_sim_flow(sys.argv[1], sys.argv[2], vdd_value=vdd)
+    mode = sys.argv[4] if len(sys.argv) > 4 else "spectre"
+    run_sim = mode in ("maestro", "spectre") and len(sys.argv) > 3 or False
+    run_sim_flow(sys.argv[1], sys.argv[2], vdd_value=vdd,
+                 sim_mode=mode, run_sim=run_sim)

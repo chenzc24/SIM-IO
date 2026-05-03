@@ -1,4 +1,4 @@
-"""Redistribute symbol pins evenly on 4 sides.
+"""Redistribute symbol pins on 2 sides (left=outer, right=CORE/duplicate).
 
 3-Step Architecture:
   Step 0: TSG (fresh symbol from schematic)
@@ -81,11 +81,11 @@ def run(lib: str, cell: str):
     engine = LayoutEngine(LayoutConfig())
     result = engine.redesign(info)
     body = result.body
-    print(f"  Outer: ({body.outer_left:.3f}, {body.outer_bottom:.3f}) "
-          f"to ({body.outer_right:.3f}, {body.outer_top:.3f})  "
-          f"({body.outer_right - body.outer_left:.3f}x"
-          f"{body.outer_top - body.outer_bottom:.3f})")
-    for side_name in ["left", "right", "top", "bottom"]:
+    print(f"  Body: ({body.left:.3f}, {body.bottom:.3f}) "
+          f"to ({body.right:.3f}, {body.top:.3f})  "
+          f"({body.right - body.left:.3f}x"
+          f"{body.top - body.bottom:.3f})")
+    for side_name in ["left", "right"]:
         count = sum(1 for p in result.pins if p.side.value == side_name)
         print(f"  {side_name}: {count} pins")
 
