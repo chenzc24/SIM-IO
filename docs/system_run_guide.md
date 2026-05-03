@@ -209,12 +209,33 @@ Input:  {lib}/{cell}_tb/schematic
 Output: netlist.scs (circuit-only Spectre netlist)
 ```
 
-Two-phase:
-1. SKILL: `simInitEnvWithArgs()` generates `si.env` on remote at `/tmp/sim_io_si_run/`
-2. Shell: `cd /tmp/sim_io_si_run ; si -batch -command nl` produces netlist
-3. Download: `client.download_file()` copies netlist to local `run_dir/netlist.scs`
+**Prerequisites** (discovered automatically from Virtuoso session):
+1. License env vars (`LM_LICENSE_FILE`, `CDS_LIC_FILE`) — si doesn't inherit Virtuoso's license
+2. Local cds.lib with SOFTINCLUDE of IC618 defaults — ensures `analogLib`/`basic` resolve
+3. `schCheck + dbSave` on the _tb schematic — si refuses modified cellviews (OSSHNL-109)
+4. Complete `si.env` — `simInitEnvWithArgs()` produces incomplete output; must write manually
+
+Steps:
+1. `schCheck + dbSave` on the _tb schematic via SKILL
+2. `_discover_cadence_env()` — query Virtuoso for license vars and cds.lib path
+3. Generate local cds.lib on remote: `SOFTINCLUDE <IC618>/share/cdssetup/cds.lib` + `INCLUDE <user>/cds.lib`
+4. Write complete `si.env` (simLibName, simCellName, simSimulator, simViewList, simStopList, simNetlistHier)
+5. Run `si -batch -cdslib <local_cdslib> -command nl` via SSH with license env vars set
+6. Download netlist to local `run_dir/netlist.scs`
 
 **Important**: `si` must run via SSH shell command, NOT via SKILL `system()` (would deadlock CIW).
+
+**Full working command** (tested on IO_RING_12x12_tb):
+```bash
+export PATH=/home/cadence/ic618/IC618Hotfix4/tools/bin:.../dfII/bin:$PATH
+export LD_LIBRARY_PATH=.../tools/lib/64bit:$LD_LIBRARY_PATH
+export LM_LICENSE_FILE=1717@lic_server:5280@thu-han
+export CDS_LIC_FILE=5280@thu-han
+/home/cadence/ic618/IC618Hotfix4/tools/dfII/bin/si \
+    -batch -cdslib /tmp/sim_io_si_run/cds.lib -command nl
+```
+
+See `docs/netlist_export_findings.md` for detailed debug notes.
 
 #### 5b: Build Sim Deck
 

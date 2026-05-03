@@ -31,6 +31,11 @@ from virtuoso_bridge.models import ExecutionStatus, SimulationResult
 from virtuoso_bridge.spectre.runner import SpectreSimulator, spectre_mode_args
 
 from sim_deck_template import SimConfig, build_sim_deck_from_file
+from sim_config import (
+    SimDeckConfig, summarize_netlist, write_sim_config_input,
+    resolve_sim_config, SPECTRE_BIN,
+)
+from site_config import SiteConfig
 from pin_types import PinInfo, classify_pin_heuristic
 
 _OUTPUT_ROOT = _SIM_IO / "output"
@@ -38,8 +43,46 @@ _OUTPUT_ROOT = _SIM_IO / "output"
 # Remote directory for si batch netlist export
 _SI_REMOTE_DIR = "/tmp/sim_io_si_run"
 
+# si.env template path
+_SI_ENV_TEMPLATE = _SIM_IO / "templates" / "si_spectre.env"
 
-# ── Step 3a: Export Netlist ────────────────────────────────────
+
+# ── Template Helpers ────────────────────────────────────────────
+
+def _load_si_env_template() -> str:
+    """Load the si.env template from SIM-IO/templates/si_spectre.env."""
+    if not _SI_ENV_TEMPLATE.is_file():
+        raise FileNotFoundError(f"si.env template not found: {_SI_ENV_TEMPLATE}")
+    return _SI_ENV_TEMPLATE.read_text(encoding="utf-8")
+
+
+def _substitute_si_env(template: str, *, library: str, top_cell: str, run_dir: str) -> str:
+    """Replace @PLACEHOLDER@ patterns in the si.env template."""
+    return (
+        template
+        .replace("@LIBRARY@", library)
+        .replace("@TOP_CELL@", top_cell)
+        .replace("@SI_RUN_DIR@", run_dir)
+    )
+
+
+# ── License Discovery (fallback) ───────────────────────────────
+
+def _discover_license_from_virtuoso(client: VirtuosoClient) -> dict[str, str]:
+    """Discover license env vars from the running Virtuoso session.
+
+    Only used as a fallback when SiteConfig doesn't have them set.
+    """
+    env = {}
+    for var in ("LM_LICENSE_FILE", "CDS_LIC_FILE"):
+        r = client.execute_skill(f'getShellEnvVar("{var}")', timeout=10)
+        val = (r.output or "").strip('"')
+        if val and val.lower() != "nil":
+            env[var] = val
+    return env
+
+
+# ── Step 3a: Netlist Export ────────────────────────────────────
 
 def export_netlist(
     client: VirtuosoClient,
@@ -47,38 +90,109 @@ def export_netlist(
     tb_cell: str,
     run_dir: Path,
     *,
-    cds_lib: str = "",
+    site: SiteConfig,
 ) -> Optional[Path]:
     """Export Spectre netlist from _tb schematic via si batch netlister.
 
-    Two-phase:
-      1. SKILL: simInitEnvWithArgs() generates si.env on remote
-      2. Shell: si -batch -command nl produces the netlist
+    Uses SiteConfig for cds.lib, IC root, and license vars.
+    License vars fall back to SKILL auto-discovery from Virtuoso.
+
+    Steps:
+      0. schCheck + dbSave on the _tb schematic (si requires it)
+      1. Create remote run directory
+      2. Write si.env from template with placeholder substitution
+      3. Resolve license vars (SiteConfig > SKILL discovery)
+      4. Run si -batch -command nl with user's cds.lib
+      5. Download netlist to local run_dir
 
     Returns the path to the downloaded netlist file, or None on failure.
     """
     print(f"[step3a] Exporting netlist for {lib}/{tb_cell}")
 
-    # 1. Generate si.env on remote
+    # 0. schCheck + dbSave — si refuses to netlist if cellview is modified
+    r = client.execute_skill(
+        f'let((cv) cv = dbOpenCellViewByType("{lib}" "{tb_cell}" "schematic" "schematic" "a") '
+        f'schCheck(cv) dbSave(cv) dbClose(cv) t)'
+    )
+    if r.errors:
+        print(f"[step3a] WARNING: schCheck/save failed: {r.errors}")
+
+    # 1. Create remote run directory
     r = client.execute_skill(f'sh("mkdir -p {_SI_REMOTE_DIR}")')
+
+    # 2. Write si.env from template
+    template = _load_si_env_template()
+    si_env_content = _substitute_si_env(
+        template,
+        library=lib,
+        top_cell=tb_cell,
+        run_dir=_SI_REMOTE_DIR,
+    )
+
+    # simInitEnvWithArgs primes the directory; then we overwrite with our template
     r = client.execute_skill(
         f'simInitEnvWithArgs("{_SI_REMOTE_DIR}" "{lib}" "{tb_cell}" '
         f'"schematic" "spectre" nil)'
     )
     if r.errors:
-        print(f"[step3a] ERROR: simInitEnvWithArgs failed: {r.errors}")
-        return None
+        print(f"[step3a] WARNING: simInitEnvWithArgs had errors: {r.errors}")
 
-    # 2. Run si batch netlister via shell command
-    #    Must use shell (not SKILL system()) to avoid CIW deadlock
-    cds_arg = f" -cdslib {shlex.quote(cds_lib)}" if cds_lib else ""
-    si_cmd = f"cd {_SI_REMOTE_DIR} ; si -batch{cds_arg} -command nl"
+    tunnel = client._tunnel
+    if tunnel is not None:
+        tunnel.upload_text(si_env_content, f"{_SI_REMOTE_DIR}/si.env")
+    else:
+        client.execute_skill(
+            f'csh("echo \'{si_env_content}\' > {_SI_REMOTE_DIR}/si.env")'
+        )
 
-    r = client.run_shell_command(si_cmd, timeout=120)
-    if r.errors:
-        print(f"[step3a] WARNING: si returned errors: {r.errors}")
+    # 3. Resolve license vars (SiteConfig > SKILL discovery)
+    license_env: dict[str, str] = {}
+    if site.lm_license_file:
+        license_env["LM_LICENSE_FILE"] = site.lm_license_file
+    if site.cds_lic_file:
+        license_env["CDS_LIC_FILE"] = site.cds_lic_file
 
-    # 3. Download netlist
+    # Fallback: discover missing license vars from Virtuoso
+    missing = [v for v in ("LM_LICENSE_FILE", "CDS_LIC_FILE") if v not in license_env]
+    if missing:
+        discovered = _discover_license_from_virtuoso(client)
+        for v in missing:
+            if v in discovered:
+                license_env[v] = discovered[v]
+
+    print(f"[step3a] License: LM_LICENSE_FILE={license_env.get('LM_LICENSE_FILE', '(missing)')}, "
+          f"CDS_LIC_FILE={license_env.get('CDS_LIC_FILE', '(missing)')}")
+
+    # 4. Run si batch netlister via SSH shell
+    ic_root = site.ic_root
+    export_lines = [
+        f"export PATH={ic_root}/tools/bin:{ic_root}/tools/dfII/bin:{ic_root}/tools/bin/64bit:$PATH",
+        f"export LD_LIBRARY_PATH={ic_root}/tools/lib/64bit:{ic_root}/tools/dfII/lib/64bit:$LD_LIBRARY_PATH",
+    ]
+    for var, val in license_env.items():
+        export_lines.append(f"export {var}={val}")
+
+    env_setup = "; ".join(export_lines)
+    si_cmd = (
+        f'{env_setup}; '
+        f'cd {_SI_REMOTE_DIR}; '
+        f'{site.si_bin} -batch -cdslib {site.cds_lib} -command nl 2>&1 | tail -20'
+    )
+
+    if tunnel is not None:
+        r = tunnel.run_command(si_cmd, timeout=300)
+        output = r.stdout or ""
+        if "ERROR" in output:
+            print(f"[step3a] si output:\n{output}")
+    else:
+        r = client.run_shell_command(
+            f'cd {_SI_REMOTE_DIR}; {site.si_bin} -batch -cdslib {site.cds_lib} -command nl',
+            timeout=300,
+        )
+        if r.errors:
+            print(f"[step3a] WARNING: si returned errors: {r.errors}")
+
+    # 5. Download netlist
     local_netlist = run_dir / "netlist.scs"
     r = client.download_file(f"{_SI_REMOTE_DIR}/netlist", str(local_netlist))
     if not r.ok:
@@ -98,11 +212,12 @@ def export_netlist(
 
 def build_deck(
     netlist_path: Path,
-    config: SimConfig,
+    config,
     run_dir: Path,
 ) -> Path:
-    """Build a complete Spectre deck from si netlist + SimConfig.
+    """Build a complete Spectre deck from si netlist + config.
 
+    Accepts SimConfig (legacy) or SimDeckConfig (new).
     Returns the path to the complete deck file.
     """
     deck_text = build_sim_deck_from_file(netlist_path, config)
@@ -307,11 +422,14 @@ def run_sim_run(
     pins: list[PinInfo],
     run_dir: Path,
     *,
-    config: Optional[SimConfig] = None,
+    config=None,
+    deck_config: Optional[SimDeckConfig] = None,
+    site: Optional[SiteConfig] = None,
     client: Optional[VirtuosoClient] = None,
-    cds_lib: str = "",
     spectre_mode: str = "spectre",
     spectre_timeout: int = 600,
+    user_intent: str = "",
+    vdd_value: float = 1.8,
 ) -> SimRunResult:
     """Run the full simulation pipeline (Steps 3a-3d).
 
@@ -320,39 +438,83 @@ def run_sim_run(
     lib, tb_cell : Library and testbench cell names
     pins : Pin info list from Step 4b (for result mapping)
     run_dir : Output directory (typically from sim_flow)
-    config : SimConfig (default: model_include from env)
+    config : SimConfig (legacy, used if deck_config is None)
+    deck_config : SimDeckConfig (new, takes priority over config)
+    site : SiteConfig (default: loaded from SIM-IO/.env)
     client : VirtuosoClient (default: from env)
-    cds_lib : Path to cds.lib on remote (empty = auto-detect)
     spectre_mode : Spectre execution mode
     spectre_timeout : Timeout in seconds
+    user_intent : Free-text simulation intent for LLM config generation
+    vdd_value : Supply voltage for default config
     """
     if client is None:
         client = VirtuosoClient.from_env()
+    if site is None:
+        site = SiteConfig.from_env()
     if config is None:
         config = SimConfig(
-            model_include=os.getenv("VB_PDK_SPECTRE_INCLUDE", ""),
+            model_include=site.pdk_spectre_include,
         )
 
     print(f"\n{'='*60}")
     print(f" Sim Run: {lib}/{tb_cell}")
-    print(f" Config:  analysis={config.analysis} stop={config.stop}")
-    print(f" Model:   {config.model_include or '(none)'}")
+    print(f" Cds.lib: {site.cds_lib}")
+    print(f" IC root: {site.ic_root}")
     print(f"{'='*60}\n")
 
     # Step 3a: Export netlist
-    netlist_path = export_netlist(client, lib, tb_cell, run_dir, cds_lib=cds_lib)
+    netlist_path = export_netlist(client, lib, tb_cell, run_dir, site=site)
+
+    # Step 3a.5: Write LLM input and resolve sim config
+    resolved_config = deck_config
+    if netlist_path is not None and resolved_config is None:
+        # Write sim_config_input.json for LLM
+        try:
+            netlist_text = netlist_path.read_text(encoding="utf-8")
+            netlist_summary = summarize_netlist(netlist_text)
+            pin_classes = None
+            pin_class_path = run_dir / "pin_classifications.json"
+            if not pin_class_path.exists():
+                pin_class_path = _SIM_IO / "pin_classifications.json"
+            if pin_class_path.exists():
+                import json as _json
+                pin_classes = _json.loads(pin_class_path.read_text(encoding="utf-8")).get("pins", [])
+            write_sim_config_input(
+                netlist_summary=netlist_summary,
+                pin_classifications=pin_classes,
+                user_intent=user_intent,
+                lib=lib, cell=tb_cell, vdd_value=vdd_value,
+                path=run_dir / "sim_config_input.json",
+            )
+            print(f"[step3a.5] Wrote sim_config_input.json")
+        except Exception as e:
+            print(f"[step3a.5] WARNING: Failed to write sim config input: {e}")
+
+        # Resolve: LLM > active.state > legacy > site default
+        resolved_config = resolve_sim_config(
+            run_dir=run_dir,
+            lib=lib, cell=tb_cell,
+            vdd_value=vdd_value,
+            user_intent=user_intent,
+            legacy_config=config,
+        )
+
+    if resolved_config is None:
+        resolved_config = config  # fallback to legacy SimConfig
 
     # Step 3b: Build deck
     deck_path = None
     if netlist_path is not None:
-        deck_path = build_deck(netlist_path, config, run_dir)
+        deck_path = build_deck(netlist_path, resolved_config, run_dir)
 
     # Step 3c: Run spectre
     spectre_ok = False
     sim_result = None
     if deck_path is not None:
+        spectre_cmd = os.getenv("SPECTRE_CMD", SPECTRE_BIN)
         sim_result = run_spectre(
             deck_path, run_dir,
+            spectre_cmd=spectre_cmd,
             mode=spectre_mode,
             timeout=spectre_timeout,
         )
@@ -399,11 +561,12 @@ if __name__ == "__main__":
 
     _lib = sys.argv[1]
     _tb_cell = sys.argv[2]
-    _model = sys.argv[3] if len(sys.argv) > 3 else os.getenv("VB_PDK_SPECTRE_INCLUDE", "")
+    _model = sys.argv[3] if len(sys.argv) > 3 else ""
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     _run_dir = _OUTPUT_ROOT / ts
     _run_dir.mkdir(parents=True, exist_ok=True)
 
-    _cfg = SimConfig(model_include=_model)
-    run_sim_run(_lib, _tb_cell, [], _run_dir, config=_cfg)
+    _site = SiteConfig.from_env()
+    _cfg = SimConfig(model_include=_model or _site.pdk_spectre_include)
+    run_sim_run(_lib, _tb_cell, [], _run_dir, config=_cfg, site=_site)

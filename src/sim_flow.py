@@ -57,6 +57,36 @@ from pin_types import (
 _SKILL_DIR = _SIM_IO / "skill_code"
 _OUTPUT_ROOT = _SIM_IO / "output"
 
+# Module-level LLM classification cache (loaded once per run)
+_llm_classifications: dict[str, PinClassification] = {}
+
+
+def _load_llm_classifications(run_dir: Path) -> dict[str, PinClassification]:
+    """Load LLM pin classifications from run_dir if available.
+
+    Search order:
+      1. run_dir/pin_classifications.json (run-specific)
+      2. _SIM_IO/pin_classifications.json (reusable global)
+
+    Returns name→PinClassification map, or empty dict if not found.
+    """
+    global _llm_classifications
+    for path in (run_dir / "pin_classifications.json", _SIM_IO / "pin_classifications.json"):
+        if path.exists():
+            result = load_pin_classifications(path)
+            _llm_classifications = build_classification_map(result)
+            print(f"[llm] Loaded {len(_llm_classifications)} LLM classifications from {path}")
+            return _llm_classifications
+    _llm_classifications = {}
+    return _llm_classifications
+
+
+def _classify_pin(pin: PinInfo) -> str:
+    """Classify a pin — LLM if available, else heuristic fallback."""
+    if pin.name in _llm_classifications:
+        return _llm_classifications[pin.name].pin_type
+    return classify_pin_heuristic(pin)
+
 
 def create_run_dir() -> Path:
     """Create and return a timestamped output directory under SIM-IO/output/.
@@ -395,7 +425,7 @@ def add_wire_labels(
     with client.schematic.edit(lib, tb_cell, mode="a") as sch:
         for pin in pins:
             # Ground pins connect directly to the global ground net
-            pad_type = classify_pin_heuristic(pin)
+            pad_type = _classify_pin(pin)
             net_name = "gnd!" if pad_type == "ground" else pin.name
             labeled_nets.append(net_name)
             cmd = label_inst_term(
@@ -477,7 +507,7 @@ def place_sources_and_loads(
         placed.append("GND0")
 
         for pin in pins:
-            pad_type = classify_pin_heuristic(pin)
+            pad_type = _classify_pin(pin)
             # ground pins are already labeled gnd! by add_wire_labels
             if pad_type == "ground":
                 continue
@@ -520,7 +550,7 @@ def place_sources_and_loads(
 
     # ── Phase 2: set CDF params ───────────────────────────
     for pin in pins:
-        pad_type = classify_pin_heuristic(pin)
+        pad_type = _classify_pin(pin)
         if pad_type == "ground":
             continue
         rule = PAD_RULES.get(pad_type)
@@ -560,15 +590,23 @@ def run_sim_flow(
     *,
     vdd_value: float = 1.8,
     run_sim: bool = False,
-    model_include: str = "",
-    cds_lib: str = "",
     spectre_mode: str = "spectre",
     client: Optional[VirtuosoClient] = None,
+    user_intent: str = "",
 ) -> SimFlowResult:
     """Run the full simulation build-up flow (Steps 1-4) and optionally run spectre.
 
     When ``run_sim=True``, also executes Steps 5a-5d:
       netlist export → deck build → spectre run → result verification.
+
+    Simulation config is resolved in this priority order:
+      1. run_dir/sim_config.json (LLM-generated)
+      2. run_dir/active.state (Maestro export)
+      3. SiteConfig defaults with pin-driven heuristics
+
+    user_intent is a free-text description of the desired simulation
+    (e.g. "DC sweep VDD from 0 to 3, then AC analysis for gain").
+    It is written to sim_config_input.json for the LLM to read.
 
     All outputs are saved under ``SIM-IO/output/<timestamp>/``.
     """
@@ -604,6 +642,9 @@ def run_sim_flow(
     # Write pin_info.json for LLM classification
     write_pin_info_json(pins, lib, primary_cell, vdd_value, run_dir / "pin_info.json")
 
+    # Load LLM classifications if available (pin_classifications.json)
+    _load_llm_classifications(run_dir)
+
     # Step 4c: Add wire labels on DUT pins
     labels = add_wire_labels(client, lib, tb_cell, pins) if pins else []
 
@@ -617,16 +658,18 @@ def run_sim_flow(
     sim_verdict = None
     if run_sim and pins:
         from sim_run import run_sim_run
-        from sim_deck_template import SimConfig
         from sim_verify import verify_results
+        from site_config import SiteConfig
+        from sim_config import SimDeckConfig
 
-        cfg = SimConfig(model_include=model_include)
+        site = SiteConfig.from_env()
         sim_result = run_sim_run(
             lib, tb_cell, pins, run_dir,
-            config=cfg,
+            site=site,
             client=client,
-            cds_lib=cds_lib,
             spectre_mode=spectre_mode,
+            user_intent=user_intent,
+            vdd_value=vdd_value,
         )
         sim_run_ok = sim_result.spectre_ok
 
@@ -672,7 +715,7 @@ def run_sim_flow(
     # Pin type breakdown
     types = {}
     for p in result.pins:
-        t = classify_pin_heuristic(p)
+        t = _classify_pin(p)
         types[t] = types.get(t, 0) + 1
     print(f"  Pin types:         {dict(sorted(types.items()))}")
     if sim_run_ok is not None:

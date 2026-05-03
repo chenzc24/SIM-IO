@@ -1,0 +1,211 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SimConfig",
+  "description": "LLM-generated simulation deck configuration for Spectre",
+  "type": "object",
+  "required": ["design_vars", "model_includes", "analyses"],
+  "properties": {
+    "lib": {
+      "type": "string",
+      "description": "Design library name"
+    },
+    "cell": {
+      "type": "string",
+      "description": "Design cell name"
+    },
+    "global_ground": {
+      "type": "string",
+      "default": "0",
+      "description": "Global ground node name (typically '0')"
+    },
+    "design_vars": {
+      "type": "array",
+      "description": "Design variables (becomes 'parameters' line in Spectre)",
+      "items": {
+        "type": "object",
+        "required": ["name", "expression"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Variable name, e.g. 'VDD'"
+          },
+          "expression": {
+            "type": "string",
+            "description": "Variable value, e.g. '1.8'"
+          }
+        }
+      }
+    },
+    "model_includes": {
+      "type": "array",
+      "description": "PDK model files with sections",
+      "items": {
+        "type": "object",
+        "required": ["path", "section"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Absolute path to model file on remote server"
+          },
+          "section": {
+            "type": "string",
+            "description": "Section name within the model file, e.g. 'pre_simu'"
+          }
+        }
+      }
+    },
+    "analyses": {
+      "type": "array",
+      "description": "Simulation analyses to run",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": ["dc", "tran", "ac", "sp", "noise", "pz", "envlp", "dcmatch"],
+            "description": "Analysis type"
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Whether to include this analysis in the deck"
+          },
+          "errpreset": {
+            "type": "string",
+            "enum": ["liberal", "moderate", "conservative"],
+            "default": "moderate",
+            "description": "Accuracy preset (tran only)"
+          },
+          "stop": {
+            "type": "string",
+            "description": "Stop time for tran (e.g. '1u'), or stop value for sweep"
+          },
+          "sweep": {
+            "type": "object",
+            "description": "Parameter sweep specification",
+            "properties": {
+              "param": {
+                "type": "string",
+                "description": "Parameter/design variable to sweep, e.g. 'VDD'"
+              },
+              "sweep_type": {
+                "type": "string",
+                "enum": ["Design Variable", "Parameter", "Temperature"],
+                "default": "Design Variable"
+              },
+              "range_type": {
+                "type": "string",
+                "enum": ["Start-Stop", "Center-Span", "Single"],
+                "default": "Start-Stop"
+              },
+              "start": {
+                "type": "string",
+                "description": "Sweep start value"
+              },
+              "stop": {
+                "type": "string",
+                "description": "Sweep stop value"
+              },
+              "lin": {
+                "type": "string",
+                "description": "Number of linear steps"
+              },
+              "dec": {
+                "type": "string",
+                "description": "Points per decade (for AC/log sweep)"
+              }
+            }
+          },
+          "extra_options": {
+            "type": "object",
+            "description": "Additional analysis-specific options as key-value pairs",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "save_signals": {
+      "type": "array",
+      "description": "Specific signals to save (if empty, uses save_default)",
+      "items": {
+        "type": "object",
+        "required": ["signal"],
+        "properties": {
+          "signal": {
+            "type": "string",
+            "description": "Signal path, e.g. '/VOUT', '/VIP'"
+          }
+        }
+      }
+    },
+    "outputs": {
+      "type": "array",
+      "description": "Named output expressions",
+      "items": {
+        "type": "object",
+        "required": ["name", "expression"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Output name, e.g. 'Av_big'"
+          },
+          "expression": {
+            "type": "string",
+            "description": "Spectre expression, e.g. 'VOUT / (VIP - VIN)'"
+          },
+          "eval_type": {
+            "type": "string",
+            "enum": ["point", "wave"],
+            "default": "point",
+            "description": "Evaluation type: point (scalar) or wave (waveform)"
+          }
+        }
+      }
+    },
+    "info_statements": {
+      "type": "array",
+      "description": "Info statements for Spectre output",
+      "items": {
+        "type": "object",
+        "required": ["info_type", "what"],
+        "properties": {
+          "info_type": {
+            "type": "string",
+            "description": "Info statement type, e.g. 'modelParameter'"
+          },
+          "what": {
+            "type": "string",
+            "description": "What to extract, e.g. 'models', 'inst'"
+          },
+          "where": {
+            "type": "string",
+            "default": "rawfile",
+            "description": "Output destination: 'rawfile' or 'logfile'"
+          }
+        }
+      }
+    },
+    "sim_options": {
+      "type": "object",
+      "description": "Simulator options",
+      "properties": {
+        "reltol": { "type": "number", "default": 1e-4 },
+        "vabstol": { "type": "number", "default": 1e-6 },
+        "iabstol": { "type": "number", "default": 1e-12 },
+        "gmin": { "type": "number", "default": 1e-12 },
+        "temp": { "type": "number", "default": 27.0 },
+        "tnom": { "type": "number", "default": 27.0 },
+        "pivrel": { "type": "number", "default": 1e-3 }
+      }
+    },
+    "save_default": {
+      "type": "string",
+      "enum": ["allpub", "all", ""],
+      "default": "allpub",
+      "description": "Default save mode when no specific save_signals"
+    }
+  }
+}
