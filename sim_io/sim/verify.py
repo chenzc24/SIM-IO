@@ -52,6 +52,8 @@ def golden_for_pin_type(pad_type: str, vdd: float) -> dict:
         "power": {
             "vmax_min": vdd * 0.99,    # Power rail should be close to VDD
             "vmax_max": vdd * 1.01,
+            "iavg_max": 0.1,           # < 100 mA quiescent per power pin
+            "pavg_max": vdd * 0.1,     # < 100mA * VDD power budget
         },
         "analog_input": {
             "vmax_min": vdd * 0.4,     # At minimum, DC bias should be present
@@ -85,6 +87,7 @@ class Tolerance:
 DEFAULT_TOLERANCES: dict[str, Tolerance] = {
     "voltage": Tolerance(absolute=0.050, relative=0.03),   # 50mV or 3%
     "current": Tolerance(absolute=0.0, relative=0.20),     # 20%
+    "power":   Tolerance(absolute=0.0, relative=0.30),     # 30%
     "delay":   Tolerance(absolute=1e-9, relative=0.10),    # 1ns or 10%
     "default": Tolerance(absolute=0.050, relative=0.05),   # 5% fallback
 }
@@ -97,6 +100,8 @@ def _tolerance_for_metric(metric: str) -> Tolerance:
         return DEFAULT_TOLERANCES["voltage"]
     if "curr" in name or name.startswith("i"):
         return DEFAULT_TOLERANCES["current"]
+    if name.startswith("p") and ("avg" in name or "max" in name or "static" in name or "dynamic" in name):
+        return DEFAULT_TOLERANCES["power"]
     if "delay" in name or "slew" in name:
         return DEFAULT_TOLERANCES["delay"]
     return DEFAULT_TOLERANCES["default"]

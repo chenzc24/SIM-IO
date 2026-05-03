@@ -340,52 +340,186 @@ def _measure_tran(data: dict, signal: str) -> dict:
     return metrics
 
 
+def _measure_dc(data: dict, signal: str, vdd: float = 1.8) -> dict:
+    """Extract key metrics from a DC sweep signal.
+
+    Finds the sweep variable (first non-signal key) and extracts
+    voltage at nominal VDD, voltage range, and DC gain.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        values = data.get(signal, [])
+        if not values:
+            return {"signal": signal, "error": "no data"}
+        return {
+            "signal": signal,
+            "v_at_vdd": None,
+            "vmin": min(values),
+            "vmax": max(values),
+            "vrange": max(values) - min(values),
+        }
+
+    v = np.array(data.get(signal, []), dtype=float)
+    if len(v) == 0:
+        return {"signal": signal, "error": "no data"}
+
+    # Find sweep variable — first key that isn't the signal or "time"
+    sweep_key = None
+    for key in data:
+        if key not in (signal, "time"):
+            sweep_key = key
+            break
+
+    metrics: dict = {
+        "signal": signal,
+        "vmin": float(np.min(v)),
+        "vmax": float(np.max(v)),
+        "vrange": float(np.max(v) - np.min(v)),
+    }
+
+    if sweep_key:
+        sweep = np.array(data.get(sweep_key, []), dtype=float)
+        if len(sweep) == len(v) and vdd > 0:
+            idx = np.argmin(np.abs(sweep - vdd))
+            metrics["v_at_vdd"] = float(v[idx])
+            # DC gain: dVout/dVdd near operating point
+            if len(v) > 2:
+                window = max(1, len(v) // 20)
+                lo = max(0, idx - window)
+                hi = min(len(v), idx + window + 1)
+                dv = v[hi - 1] - v[lo]
+                ds = sweep[hi - 1] - sweep[lo]
+                if abs(ds) > 1e-12:
+                    metrics["dc_gain"] = float(dv / ds)
+
+    return metrics
+
+
+def _measure_power(data: dict, v_signal: str, i_signal: str) -> dict:
+    """Compute power from voltage and current waveforms.
+
+    Returns average, peak, and static/dynamic power breakdown.
+    Static power uses the DC operating point (first sample or average
+    of the first 10% of the transient).
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return {"error": "numpy required for power calculation"}
+
+    v = np.array(data.get(v_signal, []), dtype=float)
+    i = np.array(data.get(i_signal, []), dtype=float)
+    if len(v) == 0 or len(i) == 0:
+        return {"error": "missing voltage or current data"}
+
+    n = min(len(v), len(i))
+    v, i = v[:n], i[:n]
+    p = v * i
+
+    # Static power: average of first 10% (before switching activity)
+    n_static = max(1, n // 10)
+    p_static = float(np.mean(np.abs(p[:n_static])))
+
+    p_avg = float(np.mean(np.abs(p)))
+    p_max = float(np.max(np.abs(p)))
+
+    return {
+        "pavg": p_avg,
+        "pmax": p_max,
+        "pstatic": p_static,
+        "pdynamic": p_avg - p_static if p_avg > p_static else 0.0,
+    }
+
+
+def _find_signal(data: dict, name: str, dut_instance: str = "DUT") -> str | None:
+    """Find a signal in PSF data by trying multiple naming conventions."""
+    candidates = [
+        f"{dut_instance}.{name}",
+        name,
+        f"/{dut_instance}/{name}",
+        f"{dut_instance}/{name}",
+    ]
+    for c in candidates:
+        if c in data:
+            return c
+    # Fuzzy match
+    for key in data:
+        if key.endswith(f".{name}") or key.endswith(f"/{name}"):
+            return key
+    return None
+
+
+def _detect_analysis_type(data: dict) -> str:
+    """Detect the primary analysis type from PSF data keys."""
+    if "time" in data:
+        return "tran"
+    # DC sweep: has a sweep variable but no "time"
+    keys = [k for k in data if k != "time"]
+    if len(keys) >= 2:
+        return "dc"
+    return "unknown"
+
+
 def parse_results(
     result: SimulationResult,
     pins: list[PinInfo],
     dut_instance: str = "DUT",
+    vdd_value: float = 1.8,
 ) -> dict:
     """Extract measurements from Spectre results, organized by pin.
 
-    Maps PSF signal names (e.g., "DUT.D0") back to pin names.
-    Returns a dict with per-pin measurements and summary.
+    Detects analysis type (DC/tran) and extracts appropriate metrics.
+    For power pins, also computes current and power measurements.
     """
     if not result.ok or not result.data:
         return {"status": "error", "errors": result.errors}
 
     data = result.data
+    analysis = _detect_analysis_type(data)
     pin_measurements = {}
 
     for pin in pins:
         pad_type = classify_pin_heuristic(pin)
-        # Skip ground — no meaningful measurement
         if pad_type == "ground":
             continue
 
-        # Try multiple PSF signal naming patterns
-        candidates = [
-            f"{dut_instance}.{pin.name}",
-            pin.name,
-            f"/{dut_instance}/{pin.name}",
-            f"{dut_instance}/{pin.name}",
-        ]
-        signal_key = None
-        for c in candidates:
-            if c in data:
-                signal_key = c
-                break
-
-        if signal_key is None:
-            # Fuzzy match: find any key ending with this pin name
-            for key in data:
-                if key.endswith(f".{pin.name}") or key.endswith(f"/{pin.name}"):
-                    signal_key = key
-                    break
+        signal_key = _find_signal(data, pin.name, dut_instance)
 
         if signal_key and signal_key in data:
-            metrics = _measure_tran(data, signal_key)
+            if analysis == "tran":
+                metrics = _measure_tran(data, signal_key)
+            elif analysis == "dc":
+                metrics = _measure_dc(data, signal_key, vdd=vdd_value)
+            else:
+                metrics = _measure_tran(data, signal_key)
+
             metrics["pad_type"] = pad_type
             metrics["psf_key"] = signal_key
+
+            # Power pin: add current + power measurements
+            if pad_type == "power":
+                src_name = f"SRC_{pin.name}"
+                i_key = _find_signal(data, f"{src_name}:PLUS", dut_instance)
+                if i_key is None:
+                    i_key = _find_signal(data, f"{src_name}", dut_instance)
+
+                if i_key and i_key in data:
+                    if analysis == "tran":
+                        i_vals = data.get(i_key, [])
+                        try:
+                            import numpy as np
+                            i_arr = np.array(i_vals, dtype=float)
+                            if len(i_arr) > 0:
+                                metrics["iavg"] = float(np.mean(np.abs(i_arr)))
+                                metrics["imax"] = float(np.max(np.abs(i_arr)))
+                        except (ImportError, ValueError):
+                            pass
+
+                    power = _measure_power(data, signal_key, i_key)
+                    if "error" not in power:
+                        metrics.update(power)
+
             pin_measurements[pin.name] = metrics
         else:
             pin_measurements[pin.name] = {
@@ -395,6 +529,7 @@ def parse_results(
 
     return {
         "status": "ok",
+        "analysis": analysis,
         "num_pins_measured": sum(
             1 for m in pin_measurements.values() if "error" not in m
         ),
@@ -532,7 +667,7 @@ def run_sim_run(
     measurements = {}
     plot_paths = []
     if sim_result is not None and sim_result.ok:
-        measurements = parse_results(sim_result, pins)
+        measurements = parse_results(sim_result, pins, vdd_value=vdd_value)
         # Save measurements
         (run_dir / "measurements.json").write_text(
             json.dumps(measurements, indent=2, default=str), encoding="utf-8"

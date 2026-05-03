@@ -37,6 +37,12 @@ TSMC28_SECTIONS = [
     "tt_r_metal",
 ]
 
+TSMC28_IO_MODEL_FILE = (
+    "/home/process/tsmc28n/IO/tphn28hpcpgv18_170a/0971001_20180621"
+    "/tphn28hpcpgv18_110a_spi/TSMCHOME/digital/Back_End/spice"
+    "/tphn28hpcpgv18_110a/tphn28hpcpgv18.spi"
+)
+
 SPECTRE_BIN = "/home/cadence/spectre/SPECTRE211/tools/bin/spectre"
 SPECTRE_LICENSE = "1717@lic_server:5280@thu-han"
 
@@ -636,7 +642,8 @@ def sim_config_from_site(
         global_ground="0",
         design_vars=[DesignVar(name="VDD", expression=str(vdd_value))],
         model_includes=[
-            ModelInclude(path=mf, section=s) for s in secs
+            *(ModelInclude(path=mf, section=s) for s in secs),
+            ModelInclude(path=TSMC28_IO_MODEL_FILE, section=""),
         ],
         analyses=[
             AnalysisSpec(name="dc", sweep=SweepSpec(

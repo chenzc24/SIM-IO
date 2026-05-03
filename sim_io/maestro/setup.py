@@ -42,6 +42,9 @@ from virtuoso_bridge.virtuoso.maestro import (
     set_current_run_mode,
 )
 
+# Default spec limits for IO ring validation
+_DEFAULT_I_MAX = 0.1       # 100 mA max quiescent current per power pin
+
 from sim_io.sim.config import (
     SimDeckConfig,
     ModelInclude,
@@ -93,6 +96,88 @@ def ensure_maestro_view(client: VirtuosoClient, lib: str, cell: str) -> str:
         print(f"[maestro] WARNING: maeSaveSetup in ensure_maestro_view: {r.errors}")
 
     return session
+
+
+# ── Auto-Generate Outputs ───────────────────────────────────────
+
+_DIGITAL_PIN_TYPES = frozenset({
+    "digital_input", "digital_output", "digital_bidirectional",
+    "clock", "reset",
+})
+
+_SKIP_PIN_TYPES = frozenset({"ground", "no_connect", "reference"})
+
+
+def _auto_generate_outputs(
+    client: VirtuosoClient,
+    tname: str,
+    pins: list[PinInfo],
+    vdd_value: float,
+    session: str,
+) -> None:
+    """Add voltage + current + power outputs with spec boundaries.
+
+    Per-pin outputs based on classification:
+      - power: voltage net + current expression + power expression + specs
+      - digital/clock/reset: voltage net + spec boundaries
+      - analog: voltage net (no spec — context-dependent)
+      - ground/no_connect/reference: skipped
+    """
+    n_voltage = 0
+    n_current = 0
+    n_power = 0
+
+    for pin in pins:
+        pad_type = classify_pin_heuristic(pin)
+        if pad_type in _SKIP_PIN_TYPES:
+            continue
+
+        sig_path = f"/{pin.name}"
+
+        # 1. Voltage output — all non-ground pins
+        add_output(client, pin.name, tname,
+                   output_type="net", signal_name=sig_path,
+                   session=session)
+        n_voltage += 1
+
+        # 2. Voltage spec boundaries — digital pins must swing rail-to-rail
+        if pad_type in _DIGITAL_PIN_TYPES:
+            set_spec(client, pin.name, tname,
+                     gt=str(round(0.1 * vdd_value, 4)),
+                     lt=str(round(vdd_value * 1.01, 4)),
+                     session=session)
+
+        # 3. Power pin: current + power expressions with specs
+        if pad_type == "power":
+            src_name = f"SRC_{pin.name}"
+
+            # Current through VDD source
+            i_name = f"I_{pin.name}"
+            i_expr = _escape_ocean_expr(f'i(\\"{src_name}/PLUS\\")')
+            add_output(client, i_name, tname,
+                       output_type="point", expr=i_expr,
+                       session=session)
+            set_spec(client, i_name, tname,
+                     gt="0",
+                     lt=str(_DEFAULT_I_MAX),
+                     session=session)
+            n_current += 1
+
+            # Power = V × I
+            p_name = f"P_{pin.name}"
+            p_expr = _escape_ocean_expr(
+                f'v(\\"{sig_path}\\") * i(\\"{src_name}/PLUS\\")'
+            )
+            add_output(client, p_name, tname,
+                       output_type="point", expr=p_expr,
+                       session=session)
+            set_spec(client, p_name, tname,
+                     gt="0",
+                     session=session)
+            n_power += 1
+
+    print(f"[maestro] Auto-generated outputs: {n_voltage} voltage, "
+          f"{n_current} current, {n_power} power")
 
 
 # ── Analysis Options Builder ───────────────────────────────────
@@ -383,19 +468,18 @@ def build_maestro_setup(
                            session=session)
                 print(f"[maestro] Output (expr): {out.name}")
         else:
-            # Auto-generate: add a net output for every non-ground pin
-            auto_pins = pins or []
-            n_added = 0
-            for pin in auto_pins:
-                pad_type = classify_pin_heuristic(pin)
-                if pad_type in ("ground", "no_connect"):
-                    continue
-                sig_path = f"/{pin.name}"  # top-level net label
-                add_output(client, pin.name, tname,
-                           output_type="net", signal_name=sig_path,
-                           session=session)
-                n_added += 1
-            print(f"[maestro] Auto-generated {n_added} outputs from pin list")
+            # Auto-generate: voltage + current + power outputs with specs
+            vdd = 1.8
+            for v in config.design_vars:
+                if v.name.upper() == "VDD":
+                    try:
+                        vdd = float(v.expression)
+                    except ValueError:
+                        pass
+                    break
+            _auto_generate_outputs(
+                client, tname, pins or [], vdd, session,
+            )
 
         # Step 11: Set run mode
         set_current_run_mode(
@@ -473,12 +557,15 @@ def discover_io_model_file(client: VirtuosoClient, io_lib: str = "tphn28hpcpgv18
     #   {lib_path}/../models/spectre/*.scs
     #   {lib_path}/../../models/spectre/io*.scs
 
-    # Search candidate paths for spectre model files
+    # Search candidate paths for spectre/spice model files
     search_patterns = [
         f'fileSearch("{lib_path}/models/spectre" "*.scs")',
         f'fileSearch("{lib_path}/../models/spectre" "*.scs")',
         f'fileSearch("{lib_path}/../../models/spectre" "*io*.scs")',
         f'fileSearch("{lib_path}" "*.scs")',
+        f'fileSearch("{lib_path}" "*.spi")',
+        f'fileSearch("{lib_path}/models/spice" "*.spi")',
+        f'fileSearch("{lib_path}/../models/spice" "*.spi")',
     ]
 
     for pattern in search_patterns:
@@ -487,13 +574,13 @@ def discover_io_model_file(client: VirtuosoClient, io_lib: str = "tphn28hpcpgv18
             output = (r.output or "").strip()
             if output and output != "nil":
                 # Parse the file list and look for IO-related model files
-                files = re.findall(r'"([^"]*\.scs)"', output)
+                files = re.findall(r'"([^"]*\.(?:scs|spi|sp))"', output)
                 for f in files:
                     lower = f.lower()
                     if any(kw in lower for kw in ("io", "pad", "gpio", "iopad")):
                         print(f"[maestro] Found IO model file: {f}")
                         return f
-                # Return first .scs file if no IO-specific match
+                # Return first file if no IO-specific match
                 if files:
                     print(f"[maestro] Found candidate model file: {files[0]}")
                     return files[0]

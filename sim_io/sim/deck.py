@@ -103,8 +103,13 @@ def _build_deck_from_deck_config(
 
     # 4. Model includes
     for mi in cfg.model_includes:
+        is_spice = mi.path.endswith(".spi") or mi.path.endswith(".sp")
         section_str = f" section={mi.section}" if mi.section else ""
+        if is_spice:
+            lines.append("simulator lang=spice")
         lines.append(f'include "{mi.path}"{section_str}')
+        if is_spice:
+            lines.append("simulator lang=spectre")
     if cfg.model_includes:
         lines.append("")
 
