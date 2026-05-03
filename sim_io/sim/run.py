@@ -14,15 +14,15 @@ import os
 import re
 import shlex
 import sys
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-_SRC_DIR = Path(__file__).resolve().parent
-_SIM_IO = _SRC_DIR.parent
+_PKG_DIR = Path(__file__).resolve().parent
+_SIM_IO = _PKG_DIR.parent.parent
 _BRIDGE_LITE = _SIM_IO.parent / "virtuoso-bridge-lite" / "src"
-for p in (_SRC_DIR, _BRIDGE_LITE):
+for p in (_BRIDGE_LITE,):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
@@ -30,13 +30,13 @@ from virtuoso_bridge import VirtuosoClient
 from virtuoso_bridge.models import ExecutionStatus, SimulationResult
 from virtuoso_bridge.spectre.runner import SpectreSimulator, spectre_mode_args
 
-from sim_deck_template import SimConfig, build_sim_deck_from_file
-from sim_config import (
+from sim_io.sim.deck import SimConfig, build_sim_deck_from_file
+from sim_io.sim.config import (
     SimDeckConfig, summarize_netlist, write_sim_config_input,
-    resolve_sim_config, SPECTRE_BIN,
+    resolve_sim_config, SPECTRE_BIN, SPECTRE_LICENSE,
 )
-from site_config import SiteConfig
-from pin_types import PinInfo, classify_pin_heuristic
+from sim_io.site_config import SiteConfig
+from sim_io.pin_types import PinInfo, classify_pin_heuristic
 
 _OUTPUT_ROOT = _SIM_IO / "output"
 
@@ -240,11 +240,18 @@ def run_spectre(
     """Run Spectre simulation on a complete deck.
 
     Wraps SpectreSimulator.from_env() — handles local vs remote automatically.
+    Sets LM_LICENSE_FILE from SPECTRE_LICENSE if not already in environment.
     """
     if not spectre_cmd:
-        spectre_cmd = os.getenv("SPECTRE_CMD", "spectre")
+        spectre_cmd = os.getenv("SPECTRE_CMD", SPECTRE_BIN)
+
+    # Ensure license env var is set for spectre
+    if SPECTRE_LICENSE and "LM_LICENSE_FILE" not in os.environ:
+        os.environ["LM_LICENSE_FILE"] = SPECTRE_LICENSE
+        print(f"[step3c] Set LM_LICENSE_FILE={SPECTRE_LICENSE}")
 
     print(f"[step3c] Running Spectre (mode={mode}, timeout={timeout}s)")
+    print(f"[step3c] Command: {spectre_cmd}")
 
     sim = SpectreSimulator.from_env(
         spectre_cmd=spectre_cmd,
@@ -406,6 +413,7 @@ class SimRunResult:
     deck_path: Optional[str]
     spectre_ok: bool
     measurements: dict
+    plot_paths: list[str] = field(default_factory=list)
     run_dir: Optional[str] = None
 
     def save(self, run_dir: Path) -> None:
@@ -520,14 +528,54 @@ def run_sim_run(
         )
         spectre_ok = sim_result.ok
 
-    # Step 3d: Parse results
+    # Step 3d: Parse results + visualize
     measurements = {}
+    plot_paths = []
     if sim_result is not None and sim_result.ok:
         measurements = parse_results(sim_result, pins)
         # Save measurements
         (run_dir / "measurements.json").write_text(
             json.dumps(measurements, indent=2, default=str), encoding="utf-8"
         )
+
+        # Step 3e: Generate SVG plots from PSF results
+        try:
+            from sim_viz import visualize_run, parse_psf_ascii, extract_dc_metrics, extract_ac_metrics
+
+            psf_dir = run_dir / f"{deck_path.stem}.raw"
+            if not psf_dir.exists():
+                # Try nested .raw/.raw
+                nested = psf_dir / psf_dir.name
+                if nested.exists():
+                    psf_dir = nested
+
+            if psf_dir.exists():
+                plots_dir = run_dir / "plots"
+                plot_paths = visualize_run(str(psf_dir), str(plots_dir))
+
+                # Extract key metrics from viz parser
+                viz_metrics = {}
+                for psf_file in psf_dir.glob("*.dc"):
+                    try:
+                        dc = parse_psf_ascii(str(psf_file))
+                        viz_metrics["dc"] = extract_dc_metrics(dc)
+                    except Exception:
+                        pass
+                    break
+                for psf_file in psf_dir.glob("*.ac"):
+                    try:
+                        ac = parse_psf_ascii(str(psf_file))
+                        viz_metrics["ac"] = extract_ac_metrics(ac)
+                    except Exception:
+                        pass
+                    break
+                if viz_metrics:
+                    (run_dir / "viz_metrics.json").write_text(
+                        json.dumps(viz_metrics, indent=2), encoding="utf-8"
+                    )
+                    print(f"[step3e] Metrics: {viz_metrics}")
+        except Exception as e:
+            print(f"[step3e] Visualization skipped: {e}")
 
     result = SimRunResult(
         lib=lib,
@@ -536,6 +584,7 @@ def run_sim_run(
         deck_path=str(deck_path) if deck_path else None,
         spectre_ok=spectre_ok,
         measurements=measurements,
+        plot_paths=[str(p) for p in plot_paths],
     )
     result.save(run_dir)
 
@@ -548,6 +597,8 @@ def run_sim_run(
     if measurements.get("pins"):
         ok_pins = sum(1 for m in measurements["pins"].values() if "error" not in m)
         print(f"  Measured: {ok_pins}/{measurements['num_pins_total']} pins")
+    if plot_paths:
+        print(f"  Plots:    {len(plot_paths)} SVG files in {run_dir / 'plots'}")
     print(f"{'='*60}\n")
 
     return result

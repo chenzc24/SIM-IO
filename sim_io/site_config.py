@@ -12,8 +12,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-_SRC_DIR = Path(__file__).resolve().parent
-_SIM_IO = _SRC_DIR.parent
+_PKG_DIR = Path(__file__).resolve().parent
+_SIM_IO = _PKG_DIR.parent
 
 
 def _load_sim_env() -> None:

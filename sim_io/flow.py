@@ -18,12 +18,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-# Resolve paths — this file lives in SIM-IO/src/
-_SRC_DIR = Path(__file__).resolve().parent
-_SIM_IO = _SRC_DIR.parent
+# Resolve paths — this file lives in SIM-IO/sim_io/
+_PKG_DIR = Path(__file__).resolve().parent
+_SIM_IO = _PKG_DIR.parent
 _BRIDGE_LITE = _SIM_IO.parent / "virtuoso-bridge-lite" / "src"
 _T28_ROOT = _SIM_IO.parent / "io-ring-orchestrator-T28"
-for p in (_SRC_DIR, _BRIDGE_LITE, _T28_ROOT):
+for p in (_BRIDGE_LITE, _T28_ROOT):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
@@ -33,14 +33,14 @@ from virtuoso_bridge.virtuoso.schematic.ops import (
     schematic_label_instance_term as label_inst_term,
 )
 from io_ring.bridge import load_skill_file
-from symbol_layout_engine import (
+from sim_io.symbol.layout_engine import (
     LayoutConfig,
     LayoutEngine,
     Side,
     generate_apply_skill,
     parse_symbol_info,
 )
-from pin_types import (
+from sim_io.pin_types import (
     PinInfo,
     PinClassification,
     ClassificationResult,
@@ -657,10 +657,10 @@ def run_sim_flow(
     sim_run_ok = None
     sim_verdict = None
     if run_sim and pins:
-        from sim_run import run_sim_run
-        from sim_verify import verify_results
-        from site_config import SiteConfig
-        from sim_config import SimDeckConfig
+        from sim_io.sim.run import run_sim_run
+        from sim_io.sim.verify import verify_results
+        from sim_io.site_config import SiteConfig
+        from sim_io.sim.config import SimDeckConfig
 
         site = SiteConfig.from_env()
         sim_result = run_sim_run(

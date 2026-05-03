@@ -16,15 +16,14 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-_SRC_DIR = Path(__file__).resolve().parent
-_SIM_IO = _SRC_DIR.parent
+_PKG_DIR = Path(__file__).resolve().parent
+_SIM_IO = _PKG_DIR.parent.parent
 sys.path.insert(0, str(_SIM_IO.parent / "virtuoso-bridge-lite" / "src"))
-sys.path.insert(0, str(_SRC_DIR))
 
 from virtuoso_bridge import VirtuosoClient
 
-from sim_flow import create_run_dir, log_skill_code
-from symbol_layout_engine import (
+from sim_io.flow import create_run_dir, log_skill_code
+from sim_io.symbol.layout_engine import (
     LayoutConfig,
     LayoutEngine,
     Side,

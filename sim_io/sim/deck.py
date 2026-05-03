@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Union
 
-from sim_config import SimDeckConfig, sim_config_from_legacy
+from sim_io.sim.config import SimDeckConfig, sim_config_from_legacy
 
 
 @dataclass

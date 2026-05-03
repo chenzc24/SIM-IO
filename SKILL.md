@@ -112,6 +112,7 @@ This ensures the pipeline always works, even without LLM involvement.
 | `src/sim_flow.py` | Main pipeline (Steps 1–4) |
 | `src/pin_types.py` | Pin data structures, PAD_RULES, heuristic fallback, LLM loader |
 | `src/symbol_layout_engine.py` | Layout calculation engine for pin redistribution |
+| `src/sim_viz.py` | PSF parser + SVG plot generator (DC sweep, AC Bode, TRAN waveform) |
 | `src/symbol_redistribute.py` | Standalone redistribution runner |
 | `src/bridge/` | Bridge call patterns for Virtuoso operations |
 | `skill_code/` | SKILL (.il) files executed on the Virtuoso side |

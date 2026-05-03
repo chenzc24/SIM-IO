@@ -23,7 +23,7 @@ Bridge 调用模式速查 — Python 端通过 rb_exec 操作 Virtuoso
 from pathlib import Path
 import sys
 
-# src/bridge/ → bridge-Agent/io-ring-orchestrator-T28/
+# sim_io/bridge/ → bridge-Agent/io-ring-orchestrator-T28/
 _T28_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "io-ring-orchestrator-T28"
 if str(_T28_ROOT) not in sys.path:
     sys.path.insert(0, str(_T28_ROOT))
