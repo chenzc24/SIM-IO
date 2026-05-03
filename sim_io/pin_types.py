@@ -38,6 +38,7 @@ class PinType(str, Enum):
     REFERENCE = "reference"
     CLOCK = "clock"
     RESET = "reset"
+    BIAS_CURRENT = "bias_current"
     NO_CONNECT = "no_connect"
 
 
@@ -59,8 +60,16 @@ class PinClassification:
     pin_type: str           # PinType value
     confidence: float       # 0.0–1.0, LLM self-assessed
     reason: str             # Why this classification was chosen
-    stimulus: Optional[str] = None   # Override: specific stimulus cell name
-    load: Optional[str] = None       # Override: specific load cell name
+    domain: str = ""        # "analog" | "digital" | "digital_hv"
+    stimulus: Optional[str] = None   # Outer stimulus cell: vdc, vpulse, idc
+    stimulus_params: Optional[dict] = None  # Outer stimulus params
+    load: Optional[str] = None       # Outer load cell: cap, res
+    load_params: Optional[dict] = None       # Outer load params
+    inner_stimulus: Optional[str] = None    # Inner (CORE) device: vdc, idc, vpulse, cap, noConn
+    inner_params: Optional[dict] = None     # Inner device params
+    inner_load: Optional[str] = None        # Inner load cell (for bidirectional): cap, res
+    inner_load_params: Optional[dict] = None  # Inner load params
+    ground_net: Optional[str] = None        # Local ground net (e.g. gnd_DAT, dgnd)
 
 
 @dataclass
@@ -70,6 +79,8 @@ class ClassificationResult:
     cell: str
     vdd_value: float
     pins: list[PinClassification]
+    vio_low: float = 0.9
+    vio_high: float = 1.8
     llm_model: str = ""
     timestamp: str = ""
 
@@ -136,6 +147,13 @@ PAD_RULES: dict[str, dict] = {
             "term": "PLUS", "ref_term": "MINUS",
             "params": {"v1": "0", "v2": "VDD", "per": "1u",
                        "tr": "1n", "tf": "1n", "pw": "500n"},
+        },
+    },
+    "bias_current": {
+        "source": {
+            "lib": "analogLib", "cell": "idc",
+            "term": "PLUS", "ref_term": "MINUS",
+            "params": {"idc": "-10u"},
         },
     },
     "analog_input": {
@@ -208,6 +226,8 @@ def classify_pin_heuristic(pin: PinInfo) -> str:
         return "power"
     if any(kw in name_upper for kw in ("VSS", "GND", "DVSS", "AVSS")):
         return "ground"
+    if name_upper.startswith("IB") or name_upper.startswith("IBUF"):
+        return "bias_current"
     if pin.direction == "input":
         return "digital_input"
     if pin.direction == "output":
@@ -241,8 +261,16 @@ def load_pin_classifications(path: str | Path) -> ClassificationResult:
             pin_type=p["pin_type"],
             confidence=p.get("confidence", 0.0),
             reason=p.get("reason", ""),
+            domain=p.get("domain", ""),
             stimulus=p.get("stimulus"),
+            stimulus_params=p.get("stimulus_params"),
             load=p.get("load"),
+            load_params=p.get("load_params"),
+            inner_stimulus=p.get("inner_stimulus"),
+            inner_params=p.get("inner_params"),
+            inner_load=p.get("inner_load"),
+            inner_load_params=p.get("inner_load_params"),
+            ground_net=p.get("ground_net"),
         )
         for p in data.get("pins", [])
     ]
@@ -251,6 +279,8 @@ def load_pin_classifications(path: str | Path) -> ClassificationResult:
         cell=data.get("cell", ""),
         vdd_value=data.get("vdd_value", 1.8),
         pins=pins,
+        vio_low=data.get("vio_low", 0.9),
+        vio_high=data.get("vio_high", 1.8),
         llm_model=data.get("llm_model", ""),
         timestamp=data.get("timestamp", ""),
     )

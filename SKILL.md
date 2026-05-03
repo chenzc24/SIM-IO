@@ -43,12 +43,46 @@ from different foundries, and apply domain knowledge that hardcoded regex cannot
 When the sim_flow pipeline reaches Step 4b, it will output `pin_info.json` to the
 run directory. At that point:
 
-1. Read `references/pin_classification.md` for the classification rules
+1. Read `references/pin_classification.md` for the classification rules and topology tables
 2. Read the `pin_info.json` file from the current run directory
-3. Classify every pin according to the rules
+3. Classify every pin according to the rules — include BOTH outer and inner side devices
 4. Write the result following the schema in `scripts/pin_classify_schema.json`
 5. Save as `pin_classifications.json` in the same run directory
 6. The pipeline will pick it up and proceed with source/load placement
+
+## Dual-Side Topology
+
+The testbench has devices on **both sides** of the DUT symbol. You MUST specify
+what goes on each side for every pin.
+
+**OUTER (left)** = IO pad side = the pin itself.
+**INNER (right)** = CORE side = `_CORE` suffix pins or duplicate pins.
+
+The outer and inner devices are **complementary**:
+
+| Outer device | Inner device | Domain |
+|-------------|-------------|--------|
+| vdc (voltage source) | idc (compliance current, ~few mA) | analog |
+| idc (current source) | vdc (compliance voltage, ~200-500mV) | analog |
+| cap (digital output load) | vpulse (digital output stimulus) | digital |
+| vpulse (digital input stimulus) | cap (digital input load) | digital |
+| — (ground = PVSS) | — | ground |
+| — (noConn) | digital_hv supply inner | digital_hv |
+
+**Value selection**: Pick reasonable but NON-ROUND values within typical ranges.
+Good: `2.7m`, `0.37`, `1.72`, `0.87`. Bad: `3m`, `0.3`, `1.8`, `0.9`.
+
+Full topology tables are in `references/pin_classification.md`.
+
+## Domains
+
+Every pin belongs to a domain that determines its ground reference:
+
+| Domain | Ground net | Ground device | Used by |
+|--------|-----------|---------------|---------|
+| `analog` | `gnd_{BLOCK}` | PVSS per block | VDD*, VREF*, VCM*, IB*, VIN* |
+| `digital` | `dgnd` | GIOL / PVSS1DGZ | D*, SDI, SDO, SYNC, GIO*, clock, reset |
+| `digital_hv` | `dgnd_hv` | PVSS2DGZ | PVDD2POC, PVSS2DGZ |
 
 ## Output Schema
 
@@ -57,35 +91,65 @@ Each pin entry must include:
 
 ```json
 {
-  "name": "DIN0",
-  "pin_type": "digital_input",
-  "confidence": 0.95,
-  "reason": "direction=input, no power/ground keyword, digital naming convention"
+  "name": "D0",
+  "pin_type": "digital_output",
+  "domain": "digital",
+  "confidence": 0.90,
+  "reason": "D prefix = data, output direction, digital domain",
+  "stimulus": null,
+  "stimulus_params": null,
+  "load": "cap",
+  "load_params": {"c": "10p"},
+  "inner_stimulus": "vpulse",
+  "inner_params": {"v1": "0", "v2": "1.72", "per": "7n", "tr": "0.1n", "tf": "0.1n", "pw": "3.5n"},
+  "ground_net": "dgnd"
 }
 ```
 
-Valid `pin_type` values are defined in `src/pin_types.py:PinType`:
-- `power`, `ground`
-- `digital_input`, `digital_output`, `digital_bidirectional`
-- `analog_input`, `analog_output`, `analog_bidirectional`
-- `clock`, `reset`, `reference`, `no_connect`
+Required fields: `name`, `pin_type`, `domain`, `confidence`, `reason`
+Dual-side fields: `stimulus`/`stimulus_params` (outer), `inner_stimulus`/`inner_params` (inner)
 
-## Stimulus/Load Rules
+Valid `pin_type`: `power`, `ground`, `digital_input`, `digital_output`, `digital_bidirectional`,
+`analog_input`, `analog_output`, `analog_bidirectional`, `clock`, `reset`, `reference`,
+`bias_current`, `no_connect`
 
-The mapping from pin type to actual Virtuoso instances is in `src/pin_types.py:PAD_RULES`.
-When the LLM classifies a pin, the Python code looks up the corresponding rule:
+Valid `domain`: `analog`, `digital`, `digital_hv`
 
-| pin_type            | Stimulus  | Load  |
-|---------------------|-----------|-------|
-| power               | vdc (VDD) | —     |
-| ground              | vdc (0V)  | —     |
-| digital_input       | vpulse    | —     |
-| digital_output      | —         | cap   |
-| digital_bidirectional | vpulse  | cap   |
-| clock               | vpulse    | —     |
-| reset               | vpulse    | —     |
-| analog_input        | vdc       | —     |
-| analog_output       | —         | cap   |
+## Naming Convention System
+
+Pin names encode their function via **prefix patterns**. The full convention is
+documented in `references/pin_classification.md`, which you MUST read before
+classifying pins. Key points:
+
+- **`VDD*`** → `power` / `analog` (typically 0.9V core), **`VIOL`** → 0.9V, **`VIOH`** → 1.8V
+- **`IB*`/`IBUF*`** → `bias_current` / `analog` (idc, NOT vdc — these are current sources)
+- **`VREF*`/`VCM*`** → `reference` / `analog` (need specific DC voltage, NOT "no stimulus")
+- **`VINP`/`VINN`** → `analog_input` / `analog` (biased at VCM, typically 0.45V)
+- **`D*`/`SDI`/`SDO`/`SYNC`/`GIO*`** → digital types / `digital` domain
+- **`PVDD2POC`** → `power` / `digital_hv`, inner = noConn
+- **`PVSS2DGZ`** → `ground` / `digital_hv`, inner = noConn
+- **`*_CORE`** → same type as the base pin, but gets inner-side devices
+
+Different users may use slightly different suffixes, but the prefix pattern is stable.
+
+## Testbench Topology: PVSS and Ground Sharing
+
+Ground pins are NOT wired to the global `gnd!` net. Instead, each functional block
+gets a **PVSS device** — a `vdc` at ~0V that provides a named local ground.
+
+Full topology rules are in `references/pin_classification.md` (Testbench Topology Rules).
+Key principles:
+
+1. **PVSS ≠ gnd!**: PVSS is a `vdc(vdc=0)` instance. PLUS = local ground net,
+   MINUS = `gnd!`. This allows ground current measurement and domain isolation.
+2. **Block-based sharing**: Pins with the same block suffix (e.g., `GND_DAT` + `GND_DAT_CORE`
+   + `VDD_DAT` = `DAT` block) share one PVSS (`PVSS_DAT`) and one local ground net (`gnd_DAT`).
+3. **Digital ground is separate**: Digital-domain pins use `dgnd` (provided by GIOL/PVSS1DGZ),
+   not analog block grounds.
+4. **Source reference terminals**: The MINUS terminal of every source/load in a block
+   connects to the block's local ground net, NOT `gnd!`.
+5. **Inner devices also use local ground**: Inner-side (CORE) device reference terminals
+   connect to the same ground net as the outer-side devices for that block.
 
 ## Label-Based Wiring
 
@@ -95,9 +159,10 @@ that share a net label.
 
 - DUT pin `DIN0` gets label `DIN0`
 - Source `SRC_DIN0` terminal `PLUS` gets label `DIN0`  →  auto-connected
-- Source `SRC_DIN0` terminal `MINUS` gets label `gnd!`  →  tied to global ground
+- Source `SRC_DIN0` terminal `MINUS` gets label for the block's local ground net
 
-Ground-type pins are wired directly to `gnd!` and get no source/load instance.
+Ground-type pins are labeled with their block's local ground net (e.g., `gnd_DAT`),
+NOT `gnd!`. The PVSS device bridges the local ground to `gnd!`.
 
 ## Fallback Behavior
 
@@ -116,6 +181,6 @@ This ensures the pipeline always works, even without LLM involvement.
 | `src/symbol_redistribute.py` | Standalone redistribution runner |
 | `src/bridge/` | Bridge call patterns for Virtuoso operations |
 | `skill_code/` | SKILL (.il) files executed on the Virtuoso side |
-| `references/pin_classification.md` | Classification rules (LLM reads this) |
+| `references/pin_classification.md` | Classification rules + dual-side topology tables (LLM reads this) |
 | `scripts/pin_classify_schema.json` | JSON schema for classification output |
 | `docs/` | Design docs and progress notes |

@@ -1,23 +1,21 @@
 """
-Bridge 调用模式速查 — Python 端通过 rb_exec 操作 Virtuoso
+Virtuoso schematic editing via rb_exec.
 
-关键发现:
-  1. rb_exec() 包装命令为 let 块，只支持单表达式返回值
-     ✗ cv = dbOpenCellViewByType(...); cv~>libName   → 语法错误
-     ✓ dbOpenCellViewByType(...)~>libName              → 单表达式 OK
+Two APIs:
 
-  2. dbOpenCellViewByType 打开 analogLib symbol 时不要加 viewType
-     ✗ dbOpenCellViewByType("analogLib" "vdc" "symbol" "symbol" "r")  → 返回 nil
-     ✓ dbOpenCellViewByType("analogLib" "vdc" "symbol")               → OK
+  1. Batch API (recommended):
+     batch_ops(lib, cell, ops) — opens CV once, runs all ops, schCheck + dbSave.
+     Use label_term() / create_inst() / create_pin() to generate ops.
+     Each op references 'cv' from the outer let — all ops share one cellview.
 
-  3. mode 参数:
-     "a" = append/edit（保留内容，不存在则创建）
-     "w" = write/overwrite（清空重建）
-     "r" = read-only
-     ⚠️ client.py 默认 mode="w"，编辑已有 cellview 必须传 mode="a"
+  2. Direct API (legacy, one rb_exec per call):
+     place_instance(), create_wire(), create_wire_label(), etc.
+     Each call independently opens/saves the cellview.
 
-  4. 复杂多步操作应写成 .il 文件，用 load_skill_file() 加载
-     单行表达式可用 rb_exec() 或 client.execute_skill()
+Notes:
+  - rb_exec() is a thin wrapper around execute_skill(), no let-wrapping.
+  - dbOpenCellViewByType on analogLib symbols: omit viewType param.
+  - mode: "a"=append, "w"=overwrite, "r"=read-only.
 """
 
 from pathlib import Path
@@ -28,12 +26,148 @@ _T28_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "io-ring-orch
 if str(_T28_ROOT) not in sys.path:
     sys.path.insert(0, str(_T28_ROOT))
 
+# sim_io/bridge/ → bridge-Agent/virtuoso-bridge-lite/src/
+_BRIDGE_LITE = Path(__file__).resolve().parent.parent.parent.parent / "virtuoso-bridge-lite" / "src"
+if str(_BRIDGE_LITE) not in sys.path:
+    sys.path.insert(0, str(_BRIDGE_LITE))
+
 from io_ring.bridge import rb_exec, load_skill_file, open_cell_view_by_type, ge_open_window, save_current_cellview, ui_redraw
 from io_ring.bridge.client import _get_client
 
+from virtuoso_bridge.virtuoso.schematic.ops import (
+    schematic_label_instance_term as label_term,
+    schematic_create_inst_by_master_name as create_inst,
+    schematic_create_pin as create_pin_skill,
+    schematic_create_wire as create_wire_skill,
+    schematic_create_wire_between_instance_terms as wire_between_terms,
+)
+from virtuoso_bridge.virtuoso.ops import escape_skill_string as _esc
+
+
+# ═══════════════════════════════════════════════════════════════
+# Batch API (recommended)
+# ═══════════════════════════════════════════════════════════════
+
+def batch_ops(
+    lib: str,
+    cell: str,
+    ops: list[str],
+    *,
+    view: str = "schematic",
+    view_type: str = "schematic",
+    mode: str = "a",
+    timeout: int = 60,
+) -> str:
+    """Execute a batch of SKILL schematic operations in one rb_exec call.
+
+    Opens CV once -> runs all ops -> schCheck -> dbSave.
+
+    ops: list of SKILL expressions referencing ``cv`` as the cellview.
+         Use label_term(), create_inst(), create_pin_skill() etc. to
+         generate ops (they accept cv_expr="cv" by default).
+    """
+    cv_open = (
+        f'dbOpenCellViewByType("{_esc(lib)}" "{_esc(cell)}" '
+        f'"{view}" "{view_type}" "{mode}")'
+    )
+    body = " ".join(ops)
+    skill = (
+        f'let((cv) cv = {cv_open} '
+        f'{body} '
+        f'schCheck(cv) dbSave(cv) "BATCH-OK")'
+    )
+    return rb_exec(skill, timeout=timeout).strip()
+
+
+def label_instance_term(
+    lib: str,
+    cell: str,
+    instance_name: str,
+    term_name: str,
+    net_name: str,
+    *,
+    stub_direction: str | None = None,
+    extension_length: float = 0.25,
+    justification: str = "centerCenter",
+    rotation: str = "R0",
+) -> str:
+    """Place a labeled wire stub on one instance terminal (single rb_exec).
+
+    Auto-computes terminal center + stub direction from instance geometry.
+    Same as bridge-lite's schematic_label_instance_term but executed via rb_exec
+    with its own open/save lifecycle.
+    """
+    return batch_ops(lib, cell, [
+        label_term(
+            instance_name, term_name, net_name,
+            stub_direction=stub_direction,
+            extension_length=extension_length,
+            justification=justification,
+            rotation=rotation,
+        ),
+    ])
+
+
+def label_instance_terms(
+    lib: str,
+    cell: str,
+    labels: list[dict],
+) -> str:
+    """Batch: label multiple instance terminals in one rb_exec call.
+
+    labels: list of dicts with keys:
+        "instance", "term", "net"  (required)
+        "stub_direction", "extension_length", "justification", "rotation"  (optional)
+    Opens CV once -> labels all terminals -> schCheck -> dbSave once.
+    """
+    ops = []
+    for lbl in labels:
+        ops.append(label_term(
+            lbl["instance"], lbl["term"], lbl["net"],
+            stub_direction=lbl.get("stub_direction"),
+            extension_length=lbl.get("extension_length", 0.25),
+            justification=lbl.get("justification", "centerCenter"),
+            rotation=lbl.get("rotation", "R0"),
+        ))
+    return batch_ops(lib, cell, ops)
+
+
+def place_and_label(
+    lib: str,
+    cell: str,
+    instances: list[dict],
+    labels: list[dict],
+) -> str:
+    """Place instances + label terminals in one rb_exec call.
+
+    instances: list of dicts with keys:
+        "lib", "cell", "view"(default "symbol"), "name", "x", "y",
+        "orient"(default "R0")
+    labels:    same format as label_instance_terms().
+    """
+    ops = []
+    for i in instances:
+        ops.append(create_inst(
+            i["lib"], i["cell"], i.get("view", "symbol"),
+            i["name"], i["x"], i["y"], i.get("orient", "R0"),
+        ))
+    for lbl in labels:
+        ops.append(label_term(
+            lbl["instance"], lbl["term"], lbl["net"],
+            stub_direction=lbl.get("stub_direction"),
+            extension_length=lbl.get("extension_length", 0.25),
+            justification=lbl.get("justification", "centerCenter"),
+            rotation=lbl.get("rotation", "R0"),
+        ))
+    return batch_ops(lib, cell, ops, timeout=120)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Direct API (legacy, one rb_exec per call)
+# ═══════════════════════════════════════════════════════════════
 
 def get_cv_info(lib: str, cell: str, view: str = "schematic") -> dict:
-    """获取 cellview 基本信息"""
+    """Get cellview basic info."""
     cv = f'dbOpenCellViewByType("{lib}" "{cell}" "{view}" "schematic" "a")'
     return {
         "lib": rb_exec(f'{cv}~>libName', timeout=15).strip().strip('"'),
@@ -45,7 +179,7 @@ def get_cv_info(lib: str, cell: str, view: str = "schematic") -> dict:
 
 def place_instance(lib: str, cell: str, master_lib: str, master_cell: str,
                    inst_name: str, x: float, y: float, orient: str = "R0") -> str:
-    """放置 instance（不指定 viewType）"""
+    """Place an instance (no viewType)."""
     cv = f'dbOpenCellViewByType("{lib}" "{cell}" "schematic" "schematic" "a")'
     master = f'dbOpenCellViewByType("{master_lib}" "{master_cell}" "symbol")'
     result = rb_exec(f'dbCreateInst({cv} {master} "{inst_name}" list({x} {y}) "{orient}")~>name', timeout=30)
@@ -54,7 +188,7 @@ def place_instance(lib: str, cell: str, master_lib: str, master_cell: str,
 
 def set_cdf_param(lib: str, cell: str, inst_name: str,
                   param_name: str, param_value: str) -> str:
-    """设置 instance CDF 参数"""
+    """Set instance CDF parameter."""
     cv = f'dbOpenCellViewByType("{lib}" "{cell}" "schematic" "schematic" "a")'
     inst = f'car(setof(x {cv}~>instances x~>name=="{inst_name}"))'
     param = f'car(setof(p cdfGetInstCDF({inst})~>parameters p~>name=="{param_name}"))'
@@ -62,8 +196,8 @@ def set_cdf_param(lib: str, cell: str, inst_name: str,
     return result.strip()
 
 
-def create_wire(lib: str, cell: str, points: list, ) -> str:
-    """创建连线 points = [(x1,y1), (x2,y2), ...]"""
+def create_wire(lib: str, cell: str, points: list) -> str:
+    """Create wire. points = [(x1,y1), (x2,y2), ...]"""
     cv = f'dbOpenCellViewByType("{lib}" "{cell}" "schematic" "schematic" "a")'
     pts_str = " ".join(f"list({x} {y})" for x, y in points)
     result = rb_exec(f'schCreateWire({cv} "route" "full" list({pts_str}) 0 0 0 nil nil)', timeout=15)
@@ -72,7 +206,7 @@ def create_wire(lib: str, cell: str, points: list, ) -> str:
 
 def create_wire_label(lib: str, cell: str, x: float, y: float,
                       text: str, align: str = "centerLeft") -> str:
-    """创建网络标签"""
+    """Create net label at (x, y)."""
     cv = f'dbOpenCellViewByType("{lib}" "{cell}" "schematic" "schematic" "a")'
     result = rb_exec(f'schCreateWireLabel({cv} nil list({x} {y}) "{text}" "{align}" "0" "stick" 0.0625 nil)', timeout=15)
     return result.strip()
@@ -80,32 +214,34 @@ def create_wire_label(lib: str, cell: str, x: float, y: float,
 
 def create_pin(lib: str, cell: str, name: str, direction: str,
                x: float, y: float, orient: str = "left") -> str:
-    """创建 pin"""
+    """Create pin."""
     cv = f'dbOpenCellViewByType("{lib}" "{cell}" "schematic" "schematic" "a")'
     result = rb_exec(f'schCreatePin({cv} nil "{name}" "{direction}" nil list({x} {y}) "{orient}")', timeout=15)
     return result.strip()
 
 
 def create_net(lib: str, cell: str, net_name: str) -> str:
-    """创建 net"""
+    """Create net."""
     cv = f'dbOpenCellViewByType("{lib}" "{cell}" "schematic" "schematic" "a")'
     result = rb_exec(f'dbCreateNet({cv} "{net_name}")~>name', timeout=15)
     return result.strip().strip('"')
 
 
 def save_cv(lib: str, cell: str, view: str = "schematic") -> str:
-    """保存 cellview"""
+    """Save cellview."""
     cv = f'dbOpenCellViewByType("{lib}" "{cell}" "{view}" "schematic" "a")'
     result = rb_exec(f'dbSave({cv})', timeout=15)
     return result.strip()
 
 
-# ====== Symbol 视图操作 ======
+# ═══════════════════════════════════════════════════════════════
+# Symbol view operations
+# ═══════════════════════════════════════════════════════════════
 
 def create_symbol_rect(lib: str, cell: str,
                        x1: float, y1: float, x2: float, y2: float,
                        layer: str = "instance", purpose: str = "drawing") -> str:
-    """在 symbol 视图中画矩形（bBox 格式: ((x1 y1) (x2 y2))）"""
+    """Draw rect in symbol view."""
     cv = f'dbOpenCellViewByType("{lib}" "{cell}" "symbol" "schematicSymbol" "a")'
     result = rb_exec(
         f'dbCreateRect({cv} list("{layer}" "{purpose}") '
@@ -116,7 +252,7 @@ def create_symbol_rect(lib: str, cell: str,
 def create_symbol_label(lib: str, cell: str, x: float, y: float,
                         text: str, align: str = "centerCenter",
                         layer: str = "device", purpose: str = "drawing") -> str:
-    """在 symbol 视图中添加标签"""
+    """Add label in symbol view."""
     cv = f'dbOpenCellViewByType("{lib}" "{cell}" "symbol" "schematicSymbol" "a")'
     result = rb_exec(
         f'dbCreateLabel({cv} list("{layer}" "{purpose}") '
@@ -125,7 +261,7 @@ def create_symbol_label(lib: str, cell: str, x: float, y: float,
 
 
 def screenshot(local_path: str, remote_path: str = None) -> str:
-    """截图并下载到本地"""
+    """Screenshot and download."""
     import time
     client = _get_client()
     if remote_path is None:

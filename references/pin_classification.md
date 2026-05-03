@@ -1,11 +1,8 @@
 # Pin Classification Rules
 
-This document defines the rules for classifying IO pins by type.
+This document defines the rules for classifying IO pins by type and determining
+their complete testbench topology (outer + inner side devices).
 The LLM reads these rules alongside `pin_info.json` to produce `pin_classifications.json`.
-
-> **Status**: This is a scaffold. The user will fill in detailed rules for their
-> specific technology / design convention. The sections below show the expected
-> structure and provide starter examples.
 
 ---
 
@@ -18,13 +15,275 @@ The LLM reads these rules alongside `pin_info.json` to produce `pin_classificati
 | `digital_input` | Digital signal input |
 | `digital_output` | Digital signal output |
 | `digital_bidirectional` | Digital tri-state or bidirectional |
-| `analog_input` | Analog signal input |
+| `analog_input` | Analog signal input (voltage) |
 | `analog_output` | Analog signal output |
 | `analog_bidirectional` | Analog bidirectional |
 | `clock` | Clock signal |
 | `reset` | Reset signal (active high or low) |
-| `reference` | Voltage/current reference |
+| `reference` | Voltage reference pin |
+| `bias_current` | Bias current input (uses idc, NOT vdc) |
 | `no_connect` | Unconnected / reserved pin |
+
+---
+
+## Domains
+
+Every pin belongs to a **domain** that determines its ground reference and device style:
+
+| Domain | Description | Ground device | Ground net convention |
+|--------|-------------|---------------|-----------------------|
+| `analog` | Analog/mixed-signal pins | PVSS (vdc ~0V) per block | `gnd_{BLOCK}` |
+| `digital` | Digital IO and core pins | GIOL / PVSS1DGZ | `dgnd` |
+| `digital_hv` | High-voltage digital supply (PVDD2POC, PVSS2DGZ) | PVSS2DGZ | `dgnd_hv` |
+
+The `domain` field is required in every pin classification entry.
+
+---
+
+## Naming Convention System
+
+Pin names in IO ring designs follow a **naming convention** that encodes both
+function and the correct stimulus type.  The convention below is derived from
+real lab supply configurations and applies across designs — different users may
+use slightly different suffixes, but the prefix pattern is stable.
+
+### How to read the convention
+
+Each prefix group implies:
+1. **pin_type** — which determines the stimulus/load cell class (vdc, idc, vpulse, cap, ...)
+2. **Stimulus value** — the actual voltage or current to apply
+3. **Domain** — analog, digital, or digital_hv
+4. **Dual-side topology** — what goes on the OUTER (left) vs INNER (right/CORE) side
+
+### Core vs IO voltage domains
+
+Most IO ring designs have **two independent IO voltage domains**:
+
+| Domain | Typical pin | Core voltage | IO voltage |
+|--------|-------------|-------------|------------|
+| Low (L) | `VIOL` | 0.9V | 0.9V |
+| High (H) | `VIOH` | 0.9V | 1.8V |
+
+**CRITICAL**: Do NOT assume all power pins use the same VDD.
+- Core supplies (`VDD*`) are typically **0.9V**
+- IO supplies (`VIO*`) may be **0.9V (low)** or **1.8V (high)** depending on the domain suffix
+- Always check the domain suffix (`L`/`H`) before assigning a voltage value
+
+---
+
+## Dual-Side Topology — Core Concept
+
+IO ring testbenches have devices on **both sides** of the symbol:
+
+```
+        OUTER (left)              DUT (symbol)          INNER (right)
+        ============              ============          ============
+
+         ┌──outer──┐              ┌───────┐            ┌──inner──┐
+    net──┤ device  ├──...   ←→   │  pin  │    ←→  ...──┤ device  ├──gnd
+         └─────────┘     label    └───────┘   label     └─────────┘
+                          wiring                         wiring
+```
+
+- **OUTER** = symbol left side = IO pad side = the actual pin
+- **INNER** = symbol right side = CORE side = `_CORE` suffix pins or duplicate pins
+
+**The outer and inner devices are complementary** — the type of device on one side
+determines what goes on the other side.
+
+---
+
+## Value Selection Rule
+
+When the rules below specify "a few mA" or "hundreds of mV" or "around VDD",
+**pick a reasonable but non-round value** within the typical range.
+Do NOT use exact integers like 3mA, 300mV, 1.8V.
+
+Good examples: `idc=2.7m`, `vdc=0.34`, `v2=1.72`
+Bad examples:  `idc=3m`,   `vdc=0.3`,  `v2=1.8`
+
+The reason: simulation with exact round values can mask real-circuit behavior.
+Slight variation exercises the design more realistically.
+
+---
+
+## Complete Topology Tables
+
+### Analog domain — Voltage-type pins (`power`, `reference`, `analog_input`)
+
+Outer gets a **voltage source** (vdc or vpulse). Inner gets a **compliance current source** (idc).
+
+| pin_type | OUTER device | OUTER params (example) | INNER device | INNER params (range) | INNER on |
+|----------|-------------|----------------------|-------------|---------------------|----------|
+| `power` | vdc | `vdc=0.9` (per domain) | idc | `idc=1~5mA` pick non-round, e.g. `2.7m` | CORE/duplicate |
+| `reference` | vdc | `vdc=<specific V>` | idc | `idc=1~5mA` pick non-round, e.g. `3.4m` | CORE/duplicate |
+| `analog_input` | vdc | `vdc=<bias V>` | idc | `idc=1~5mA` pick non-round, e.g. `1.8m` | CORE/duplicate |
+
+Inner wiring: idc PLUS = CORE pin net, idc MINUS = block local ground.
+
+### Analog domain — Current-type pins (`bias_current`)
+
+Outer gets a **current source** (idc). Inner gets a **compliance voltage source** (vdc).
+
+| pin_type | OUTER device | OUTER params (example) | INNER device | INNER params (range) | INNER on |
+|----------|-------------|----------------------|-------------|---------------------|----------|
+| `bias_current` | idc | `idc=-10u` (per design) | vdc | `vdc=200~500mV` pick non-round, e.g. `0.37` | CORE/duplicate |
+
+Inner wiring: vdc PLUS = CORE pin net, vdc MINUS = block local ground.
+
+### Analog domain — Ground pins
+
+| pin_type | OUTER device | INNER device |
+|----------|-------------|-------------|
+| `ground` | PVSS (vdc vdc=~0V) | — (ground pin has no CORE counterpart) |
+
+PVSS is NOT gnd!. It is a `vdc` instance at ~0V. PLUS = local ground net, MINUS = gnd!.
+
+### Digital domain — Output IO
+
+Outer = **load** (cap). Inner (CORE) = **stimulus** (vpulse to digital ground).
+
+| pin_type | OUTER device | OUTER params | INNER device | INNER params | INNER on |
+|----------|-------------|-------------|-------------|-------------|----------|
+| `digital_output` | cap | `c=10p` | vpulse | `v1=0, v2=~VDD (non-round, e.g. 1.72), per=~7n, tr=0.1n, tf=0.1n, pw=~3.5n` | CORE |
+
+Inner wiring: vpulse PLUS = CORE pin net, vpulse MINUS = digital ground (dgnd).
+
+### Digital domain — Input IO
+
+Outer = **stimulus** (vpulse to ground). Inner (CORE) = **load** (cap to digital ground).
+
+| pin_type | OUTER device | OUTER params | INNER device | INNER params | INNER on |
+|----------|-------------|-------------|-------------|-------------|----------|
+| `digital_input` | vpulse | `v1=0, v2=~VDD (non-round, e.g. 0.87), per=~7n, tr=0.1n, tf=0.1n, pw=~3.5n` | cap | `c=10p` | CORE |
+
+Inner wiring: cap PLUS = CORE pin net, cap MINUS = digital ground (dgnd).
+
+### Digital domain — Bidirectional IO
+
+Both sides get both stimulus and load. Outer = vpulse + cap. Inner (CORE) = vpulse + cap.
+The outer vpulse drives the pad side; the inner vpulse drives the core side.
+
+| pin_type | OUTER device | INNER device | INNER on |
+|----------|-------------|-------------|----------|
+| `digital_bidirectional` | vpulse + cap | vpulse + cap | CORE |
+
+Outer vpulse MINUS = ground, cap MINUS = ground.
+Inner vpulse MINUS = digital ground (dgnd), cap MINUS = digital ground (dgnd).
+
+### Digital domain — Clock and Reset
+
+| pin_type | OUTER device | OUTER params | INNER device | INNER params | INNER on |
+|----------|-------------|-------------|-------------|-------------|----------|
+| `clock` | vpulse | `v1=0, v2=~VDD (non-round), per=actual, tr=0.1n, tf=0.1n` | cap | `c=10p` | CORE |
+| `reset` | vpulse | `v1=0, v2=~VDD (non-round), per=~1u, pw=~500n` | cap | `c=10p` | CORE |
+
+Clock outer: MINUS = ground. Clock inner: cap MINUS = digital ground (dgnd).
+
+### Digital domain — Supply and Ground pins
+
+| Pin pattern | pin_type | domain | OUTER device | INNER device | INNER on |
+|-------------|----------|--------|-------------|-------------|----------|
+| Normal digital VDD (`VDDCLK`, `VDD_CKB`, etc.) | `power` | `digital` | vdc (actual V) | idc (~few mA, non-round) | duplicate |
+| Normal digital ground (`VSSCLK`, `GND_CKB`, etc.) | `ground` | `digital` | PVSS (~0V) | — | — |
+| High-voltage VDD (`PVDD2POC`) | `power` | `digital_hv` | vdc (actual V) | **noConn** (basic lib) | duplicate |
+| High-voltage ground (`PVSS2DGZ`) | `ground` | `digital_hv` | PVSS (~0V) | **noConn** (basic lib) | duplicate |
+
+**noConn**: `analogLib/noConn` symbol. Placed on the duplicate (right) side to indicate
+the pin is intentionally left unconnected on the inner side. This prevents LVS warnings.
+
+### Digital domain — GIOL (Digital ground device)
+
+The digital ground device is conventionally named **GIOL** or **PVSS1DGZ**.
+It is a PVSS (`vdc vdc=0`) whose PLUS provides the `dgnd` net, and MINUS = `gnd!`.
+All digital inner-side device reference terminals connect to `dgnd`, NOT `gnd!`.
+
+---
+
+## Prefix -> pin_type Mapping (with domain)
+
+### Power supply pins (`VDD*`, `VIO*`)
+
+| Prefix | pin_type | domain | OUTER Stimulus | Typical value | Notes |
+|--------|----------|--------|---------------|---------------|-------|
+| `VDD*` | `power` | `analog` | vdc | 0.9V | Core supply |
+| `VIOL` | `power` | `analog` | vdc | 0.9V | Low-voltage IO domain supply |
+| `VIOH` | `power` | `analog` | vdc | 1.8V | High-voltage IO domain supply |
+| `VDDCLK`, `VDD_CKB`, `VDDDAT` | `power` | `digital` | vdc | 0.9V | Digital block supply |
+| `PVDD2POC` | `power` | `digital_hv` | vdc | per design | High-voltage digital supply |
+
+### Ground pins (`VSS*`, `GND*`)
+
+| Prefix | pin_type | domain | Stimulus | Notes |
+|--------|----------|--------|----------|-------|
+| `VSS*` (analog) | `ground` | `analog` | PVSS | Block-local ground |
+| `GND*` (analog) | `ground` | `analog` | PVSS | Block-local ground |
+| `VSS*`/`GND*` (digital) | `ground` | `digital` | PVSS → dgnd | Digital ground domain |
+| `PVSS2DGZ` | `ground` | `digital_hv` | PVSS → dgnd_hv | High-voltage digital ground |
+
+### Bias current pins (`IB*`)
+
+| Prefix | pin_type | domain | OUTER Stimulus | Typical value | Notes |
+|--------|----------|--------|---------------|---------------|-------|
+| `IB*` | `bias_current` | `analog` | **idc** | -10uA to -15uA | Current INTO the DUT |
+| `IBUF*` | `bias_current` | `analog` | **idc** | +10uA to +120uA | Buffer bias |
+
+**IMPORTANT**: `IB*` pins use `analogLib/idc`, NOT `analogLib/vdc`.
+Negative current = flowing into the DUT pin.
+
+### Reference voltage pins (`VREF*`)
+
+| Prefix | pin_type | domain | OUTER Stimulus | Typical value | Notes |
+|--------|----------|--------|---------------|---------------|-------|
+| `VREFH` | `reference` | `analog` | vdc | 1.8V | High reference |
+| `VREFM` | `reference` | `analog` | vdc | 1.4V | Mid reference |
+| `VREFN` | `reference` | `analog` | vdc | 0.0V | Low reference |
+| `VREFDES*` | `reference` | `analog` | vdc | 0.9V | Design reference |
+
+**IMPORTANT**: Reference pins are NOT "no stimulus". They require specific DC voltage.
+
+### Common-mode pins (`VCM*`, `VINCM*`)
+
+| Prefix | pin_type | domain | OUTER Stimulus | Typical value |
+|--------|----------|--------|---------------|---------------|
+| `VCM*` | `reference` | `analog` | vdc | 0.45V (VIOL/2) |
+| `VINCM*` | `reference` | `analog` | vdc | 0.45V |
+
+### Differential analog input pins (`VIN*`)
+
+| Prefix | pin_type | domain | OUTER Stimulus | Typical value |
+|--------|----------|--------|---------------|---------------|
+| `VINP` | `analog_input` | `analog` | vdc | 0.45V (biased at VCM) |
+| `VINN` | `analog_input` | `analog` | vdc | 0.45V |
+
+### Clock pins (`*CLK*`, `*CK*`, `SCK*`)
+
+| Prefix | pin_type | domain | OUTER Stimulus | Typical value |
+|--------|----------|--------|---------------|---------------|
+| `*CLK*` | `clock` | `digital` | vpulse | 0→~VDD |
+
+### Reset pins (`RST*`)
+
+| Prefix | pin_type | domain | OUTER Stimulus | Typical value |
+|--------|----------|--------|---------------|---------------|
+| `RST*` | `reset` | `digital` | vpulse | 0→~VDD |
+
+### Digital data pins (`D*`, `SDI`, `SDO`, `SLP`, `SYNC`, `GIO*`)
+
+| Prefix | pin_type | domain | OUTER Stimulus | OUTER Load | Notes |
+|--------|----------|--------|---------------|-----------|-------|
+| `D[0-9]*` | `digital_bidirectional` | `digital` | vpulse | cap 10pF | Data bus |
+| `SDI` | `digital_input` | `digital` | vpulse | — | SPI data in |
+| `SDO` | `digital_output` | `digital` | — | cap 10pF | SPI data out |
+| `SLP` | `digital_input` | `digital` | vpulse | — | Sleep control |
+| `SYNC` | `digital_bidirectional` | `digital` | vpulse | cap 10pF | Synchronization |
+| `GIO*` | `digital_bidirectional` | `digital` | vpulse | cap 10pF | GPIO pad |
+
+### Core-side duplicates (`*_CORE`)
+
+`*_CORE` pins share the same `pin_type` and `domain` as their base pin.
+Their **inner device** is determined by the dual-side topology tables above.
+The pipeline handles their placement on the right side of the symbol.
 
 ---
 
@@ -32,92 +291,213 @@ The LLM reads these rules alongside `pin_info.json` to produce `pin_classificati
 
 Classify in this order — first match wins:
 
-1. **Power / Ground** — supply nets (see naming patterns below)
-2. **Clock** — clock signals
-3. **Reset** — reset signals
-4. **Analog vs Digital** — distinguish by naming or direction
-5. **Input / Output / Bidirectional** — use terminal direction
+1. **Power** — `VDD*`, `VIO*`, `PVDD*` prefixes
+2. **Ground** — `VSS*`, `GND*`, `PVSS*` prefixes
+3. **Bias current** — `IB*`, `IBUF*` prefixes (BEFORE analog — NOT analog_input!)
+4. **Reference** — `VREF*`, `VCM*`, `VINCM*` prefixes
+5. **Clock** — `*CLK*`, `*CK*`, `SCK*` prefixes
+6. **Reset** — `RST*` prefix
+7. **Analog input** — `VINP`, `VINN` prefixes
+8. **Digital by direction** — `SDI`→input, `SDO`→output, `D*`/`GIO*`/`SYNC`→bidirectional
+9. **Direction-based fallback** — input→digital_input, output→digital_output, inputOutput→digital_bidirectional
 
 ---
 
-## Rule 1: Power Pins
+## Testbench Topology Rules
 
-<!-- USER: Fill in your technology-specific power pin naming conventions -->
+### Rule 1: PVSS ground device — every ground pin gets a PVSS, not gnd!
 
-**Keywords**: `VDD`, `VCC`, `DVDD`, `AVDD`, `VDDIO`, `VDDCORE`, ...
+Place a `vdc` instance (cell = `vdc`, param `vdc=0`) for each ground domain.
+The PVSS PLUS terminal provides a local ground net; MINUS connects to `gnd!`.
 
-**Examples**:
-| Pin name | Direction | → Type |
-|----------|-----------|--------|
-| VDD | inputOutput | power |
-| DVDD | inputOutput | power |
-| AVDD | inputOutput | power |
-| VDDIO | inputOutput | power |
+```
+PVSS_DAT:  analogLib/vdc  params={vdc=0}
+  PLUS  → net "gnd_DAT"  (shared by GND_DAT, GND_DAT_CORE)
+  MINUS → net "gnd!"     (global reference)
+```
 
----
+### Rule 2: Ground sharing — pins in the same functional block share one PVSS
 
-## Rule 2: Ground Pins
+Extract the **block identifier** from pin names by stripping the type prefix
+(`VDD`/`GND`/`VSS`/`IB`/`VCM`/`VREF`/`VIN`) and keeping the suffix.
 
-<!-- USER: Fill in your technology-specific ground pin naming conventions -->
+| Pin names | Block ID | Shared PVSS | Shared ground net |
+|-----------|----------|-------------|-------------------|
+| `GND_DAT`, `GND_DAT_CORE`, `VDD_DAT`, `VDD_DAT_CORE` | `DAT` | `PVSS_DAT` | `gnd_DAT` |
+| `GND_CKB`, `GND_CKB_CORE`, `VDD_CKB`, `VDD_CKB_CORE` | `CKB` | `PVSS_CKB` | `gnd_CKB` |
+| `VSSCLK`, `VDDCLK`, `DCLK` | `CLK` | `PVSS_CLK` | `gnd_CLK` |
+| `VSSSAR`, `VDDSAR` | `SAR` | `PVSS_SAR` | `gnd_SAR` |
+| `VSSIB`, `VSSIB_CORE`, `VDDIB`, `VDDIB_CORE`, `IBUF_IBIAS` | `IB` | `PVSS_IB` | `gnd_IB` |
+| `VSS` | (top-level) | `PVSS` | `gnd_VSS` |
 
-**Keywords**: `VSS`, `GND`, `DVSS`, `AVSS`, `VSSIO`, `VSSCORE`, ...
+All non-ground pins in the same block connect their source/load reference
+terminals (MINUS of vdc/idc/vpulse) to the block's local ground net, NOT to `gnd!`.
 
-**Examples**:
-| Pin name | Direction | → Type |
-|----------|-----------|--------|
-| VSS | inputOutput | ground |
-| DVSS | inputOutput | ground |
-| GND | inputOutput | ground |
+Example: in the `DAT` block:
+- `PVSS_DAT`: PLUS = `gnd_DAT`, MINUS = `gnd!`
+- `VDD_DAT` source: PLUS = `VDD_DAT`, MINUS = `gnd_DAT` (NOT `gnd!`)
+- `GND_DAT` label: `gnd_DAT` (NOT `gnd!`)
 
----
+### Rule 3: Digital ground is separate
 
-## Rule 3: Clock Pins
+All digital-domain inner-side device reference terminals connect to the
+**digital ground** (`dgnd`), provided by GIOL/PVSS1DGZ. This is a separate
+PVSS instance from analog block grounds.
 
-<!-- USER: Fill in clock pin patterns -->
+```
+GIOL:  analogLib/vdc  params={vdc=0}
+  PLUS  → net "dgnd"     (digital ground)
+  MINUS → net "gnd!"     (global reference)
+```
 
-**Keywords**: `CLK`, `CK`, `CLOCK`, ...
+### Rule 4: Cross-block pins without an explicit ground
 
-**Examples**:
-| Pin name | Direction | → Type |
-|----------|-----------|--------|
-| CLK | input | clock |
-| SYS_CLK | input | clock |
-| REF_CLK | input | clock |
+Some blocks may have VDD pins but no explicit GND pin (e.g., only `VDD3` without
+`GND3`). In this case:
+- If the block suffix matches an existing PVSS, use that local ground
+- If no matching PVSS exists, create a new `PVSS_{block}` and use it
 
----
+### Rule 5: Top-level ground pins
 
-## Rule 4: Reset Pins
-
-<!-- USER: Fill in reset pin patterns -->
-
-**Keywords**: `RST`, `RESET`, `RST_N`, ...
-
-**Examples**:
-| Pin name | Direction | → Type |
-|----------|-----------|--------|
-| RST | input | reset |
-| RST_N | input | reset |
-| RESET | input | reset |
-
----
-
-## Rule 5: Analog vs Digital
-
-<!-- USER: Define how to distinguish analog from digital pins in your design -->
-
-**Analog keywords**: `A_`, `ANA`, `VIN`, `VOUT`, `VBG`, `VREF`, ...
-**Digital keywords**: `D_`, `DIN`, `DOUT`, `DATA`, `EN`, `CS`, ...
-
-**When no keyword matches**: fall back to terminal direction alone.
+Pins with no block suffix (e.g., plain `VSS`) get their own `PVSS` instance
+named `PVSS` with net `gnd_VSS`.
 
 ---
 
-## Rule 6: Direction-Based Fallback
+## Classification Output — Full Example
 
-If no naming pattern matches, use the terminal direction:
-- `input` → `digital_input`
-- `output` → `digital_output`
-- `inputOutput` → `digital_bidirectional`
+### Analog block pin
+
+```json
+{
+  "name": "VDD_DAT",
+  "pin_type": "power",
+  "domain": "analog",
+  "confidence": 0.98,
+  "reason": "VDD prefix, DAT block, analog domain, 0.9V core supply",
+  "stimulus": "vdc",
+  "stimulus_params": {"vdc": "0.9"},
+  "load": null,
+  "load_params": null,
+  "inner_stimulus": "idc",
+  "inner_params": {"idc": "2.7m"},
+  "ground_net": "gnd_DAT"
+}
+```
+
+### Analog bias current pin
+
+```json
+{
+  "name": "IB3",
+  "pin_type": "bias_current",
+  "domain": "analog",
+  "confidence": 0.95,
+  "reason": "IB prefix = bias current, idc not vdc, block=3",
+  "stimulus": "idc",
+  "stimulus_params": {"idc": "-10u"},
+  "load": null,
+  "load_params": null,
+  "inner_stimulus": "vdc",
+  "inner_params": {"vdc": "0.37"},
+  "ground_net": "gnd_3"
+}
+```
+
+### Digital output pin (outer=cap, inner=vpulse)
+
+```json
+{
+  "name": "D0",
+  "pin_type": "digital_output",
+  "domain": "digital",
+  "confidence": 0.90,
+  "reason": "D prefix = data, direction=output, digital domain",
+  "stimulus": null,
+  "stimulus_params": null,
+  "load": "cap",
+  "load_params": {"c": "10p"},
+  "inner_stimulus": "vpulse",
+  "inner_params": {"v1": "0", "v2": "1.72", "per": "7n", "tr": "0.1n", "tf": "0.1n", "pw": "3.5n"},
+  "ground_net": "dgnd"
+}
+```
+
+### Digital input pin (outer=vpulse, inner=cap)
+
+```json
+{
+  "name": "SDI",
+  "pin_type": "digital_input",
+  "domain": "digital",
+  "confidence": 0.95,
+  "reason": "SDI = serial data in, digital input",
+  "stimulus": "vpulse",
+  "stimulus_params": {"v1": "0", "v2": "0.87", "per": "7n", "tr": "0.1n", "tf": "0.1n", "pw": "3.5n"},
+  "load": null,
+  "load_params": null,
+  "inner_stimulus": "cap",
+  "inner_params": {"c": "10p"},
+  "ground_net": "dgnd"
+}
+```
+
+### Digital high-voltage supply pin
+
+```json
+{
+  "name": "PVDD2POC",
+  "pin_type": "power",
+  "domain": "digital_hv",
+  "confidence": 0.98,
+  "reason": "PVDD prefix, high-voltage digital supply, inner=noConn",
+  "stimulus": "vdc",
+  "stimulus_params": {"vdc": "3.3"},
+  "load": null,
+  "load_params": null,
+  "inner_stimulus": "noConn",
+  "inner_params": null,
+  "ground_net": "dgnd_hv"
+}
+```
+
+### Ground pin
+
+```json
+{
+  "name": "GND_DAT",
+  "pin_type": "ground",
+  "domain": "analog",
+  "confidence": 0.98,
+  "reason": "GND prefix, DAT block ground, shared PVSS_DAT",
+  "stimulus": null,
+  "stimulus_params": null,
+  "load": null,
+  "load_params": null,
+  "inner_stimulus": null,
+  "inner_params": null,
+  "ground_net": "gnd_DAT"
+}
+```
+
+### Reference pin (voltage source + inner compliance)
+
+```json
+{
+  "name": "VREFH",
+  "pin_type": "reference",
+  "domain": "analog",
+  "confidence": 0.95,
+  "reason": "VREFH = high reference voltage 1.8V, inner=idc compliance",
+  "stimulus": "vdc",
+  "stimulus_params": {"vdc": "1.8"},
+  "load": null,
+  "load_params": null,
+  "inner_stimulus": "idc",
+  "inner_params": {"idc": "3.4m"},
+  "ground_net": "gnd"
+}
+```
 
 ---
 
@@ -127,14 +507,15 @@ When classifying, assign a confidence score:
 
 | Score | Meaning |
 |-------|---------|
-| 0.9–1.0 | Exact keyword match, unambiguous |
-| 0.7–0.9 | Pattern match with high confidence |
-| 0.5–0.7 | Direction-based fallback, no keyword clue |
+| 0.9–1.0 | Exact prefix match, unambiguous type, domain, and topology |
+| 0.7–0.9 | Prefix match with some ambiguity (e.g., `SYNC` could be digital or analog) |
+| 0.5–0.7 | Direction-based fallback, no prefix clue |
 | < 0.5 | Wild guess — flag for user review |
 
 ---
 
 ## Custom Overrides
 
-If the user provides additional context (e.g., "pin X is actually a clock"),
-override the rule-based classification and note it in the `reason` field.
+If the user provides additional context (e.g., "pin X is actually a clock",
+"VDD is 3.3V for this design"), override the rule-based classification and
+note it in the `reason` field.

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Pin Classification Output",
-  "description": "Schema for LLM-generated pin classification results",
+  "description": "Schema for LLM-generated pin classification results with dual-side topology",
   "type": "object",
   "required": ["lib", "cell", "vdd_value", "pins"],
   "properties": {
@@ -15,7 +15,15 @@
     },
     "vdd_value": {
       "type": "number",
-      "description": "Supply voltage in volts"
+      "description": "Core supply voltage in volts (e.g. 0.9)"
+    },
+    "vio_low": {
+      "type": "number",
+      "description": "Low-domain IO voltage in volts (e.g. 0.9)"
+    },
+    "vio_high": {
+      "type": "number",
+      "description": "High-domain IO voltage in volts (e.g. 1.8)"
     },
     "llm_model": {
       "type": "string",
@@ -29,7 +37,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["name", "pin_type", "confidence", "reason"],
+        "required": ["name", "pin_type", "domain", "confidence", "reason"],
         "properties": {
           "name": {
             "type": "string",
@@ -49,9 +57,15 @@
               "clock",
               "reset",
               "reference",
+              "bias_current",
               "no_connect"
             ],
             "description": "Classified pin type"
+          },
+          "domain": {
+            "type": "string",
+            "enum": ["analog", "digital", "digital_hv"],
+            "description": "Circuit domain — determines ground reference and device style"
           },
           "confidence": {
             "type": "number",
@@ -61,15 +75,47 @@
           },
           "reason": {
             "type": "string",
-            "description": "Why this classification was chosen"
+            "description": "Why this classification was chosen (including topology rationale)"
           },
           "stimulus": {
             "type": ["string", "null"],
-            "description": "Override: specific stimulus cell name (e.g. 'vpulse', 'vpwl')"
+            "description": "Outer (left) side stimulus device cell name: 'vdc', 'vpulse', 'idc', or null"
+          },
+          "stimulus_params": {
+            "type": ["object", "null"],
+            "description": "Outer stimulus parameters, e.g. {\"vdc\": \"0.9\"} or {\"v1\": \"0\", \"v2\": \"0.87\", \"per\": \"7n\", ...}",
+            "additionalProperties": { "type": "string" }
           },
           "load": {
             "type": ["string", "null"],
-            "description": "Override: specific load cell name (e.g. 'cap', 'res')"
+            "description": "Outer (left) side load device cell name: 'cap', 'res', or null"
+          },
+          "load_params": {
+            "type": ["object", "null"],
+            "description": "Outer load parameters, e.g. {\"c\": \"10p\"}",
+            "additionalProperties": { "type": "string" }
+          },
+          "inner_stimulus": {
+            "type": ["string", "null"],
+            "description": "Inner (right/CORE) side device: 'vdc', 'vpulse', 'idc', 'cap', 'noConn', or null"
+          },
+          "inner_params": {
+            "type": ["object", "null"],
+            "description": "Inner device parameters, e.g. {\"idc\": \"2.7m\"} or {\"v1\": \"0\", \"v2\": \"1.72\", \"per\": \"7n\", ...}",
+            "additionalProperties": { "type": "string" }
+          },
+          "inner_load": {
+            "type": ["string", "null"],
+            "description": "Inner (right/CORE) side load device: 'cap', 'res', or null. Used for bidirectional pins that need both inner stimulus and load."
+          },
+          "inner_load_params": {
+            "type": ["object", "null"],
+            "description": "Inner load parameters, e.g. {\"c\": \"10p\"}",
+            "additionalProperties": { "type": "string" }
+          },
+          "ground_net": {
+            "type": ["string", "null"],
+            "description": "Local ground net name for this pin's block (e.g. 'gnd_DAT', 'dgnd'). Source/load MINUS terminals connect here, NOT gnd!. Null = use gnd! (top-level only)."
           }
         }
       }

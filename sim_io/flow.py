@@ -28,11 +28,12 @@ for p in (_BRIDGE_LITE, _T28_ROOT):
         sys.path.insert(0, str(p))
 
 from virtuoso_bridge import VirtuosoClient
-from virtuoso_bridge.virtuoso.schematic.ops import (
-    schematic_create_inst_by_master_name as inst,
-    schematic_label_instance_term as label_inst_term,
+from io_ring.bridge import load_skill_file, rb_exec
+from sim_io.bridge.edit_patterns import (
+    batch_ops,
+    label_term,
+    create_inst,
 )
-from io_ring.bridge import load_skill_file
 from sim_io.symbol.layout_engine import (
     LayoutConfig,
     LayoutEngine,
@@ -324,11 +325,10 @@ def create_tb_cellview(client: VirtuosoClient, lib: str, primary_cell: str) -> s
 
 # ── Step 4a: Place DUT Instance ─────────────────────────────
 
-def place_dut(client: VirtuosoClient, lib: str, tb_cell: str, primary_cell: str) -> bool:
+def place_dut(lib: str, tb_cell: str, primary_cell: str) -> bool:
     """Place the primary cell's symbol as DUT instance in _tb schematic."""
-    with client.schematic.edit(lib, tb_cell, mode="a") as sch:
-        cmd = inst(lib, primary_cell, "symbol", "DUT", 2.5, 0.0, "R0")
-        sch.add(cmd)
+    ops = [create_inst(lib, primary_cell, "symbol", "DUT", 2.5, 0.0, "R0")]
+    batch_ops(lib, tb_cell, ops)
     print(f"[step4a] DUT placed: OK")
     return True
 
@@ -400,46 +400,46 @@ def extract_dut_pins(client: VirtuosoClient, lib: str, primary_cell: str) -> lis
 
 
 def add_wire_labels(
-    client: VirtuosoClient,
     lib: str,
     tb_cell: str,
     pins: list[PinInfo],
-    dut_xy: tuple[float, float] = (2.5, 0.0),
 ) -> list[str]:
     """Add labeled wire stubs on each DUT instance terminal.
 
-    Uses SchematicEditor context + schematic_label_instance_term from
-    virtuoso-bridge-lite which:
-    1. Finds the instance terminal center (with coordinate transform)
-    2. Creates a short wire stub from the terminal outward
-    3. Places a net label on the stub
+    Uses label_term() from bridge-lite (auto-computes terminal center
+    + stub direction from instance geometry) executed via batch_ops.
 
     Label-based wiring: same net name on DUT pin and source pin
     means Virtuoso auto-connects them.
 
-    For 2-side (left/right) layout, stub_direction forces horizontal wires.
+    Ground pins are labeled with their local ground_net (e.g. gnd_DAT, dgnd)
+    instead of gnd!, so they connect through PVSS devices.
 
     Returns list of net names that were labeled.
     """
     labeled_nets = []
     cfg = SIDE_CONFIGS
+    ops = []
 
-    with client.schematic.edit(lib, tb_cell, mode="a") as sch:
-        for pin in pins:
-            # Ground pins connect directly to the global ground net
-            pad_type = _classify_pin(pin)
-            net_name = "gnd!" if pad_type == "ground" else pin.name
-            labeled_nets.append(net_name)
-            cmd = label_inst_term(
-                "DUT", pin.name, net_name,
-                cv_expr="cv",
-                rotation=cfg[pin.side]["label_rotation"],
-                justification=cfg[pin.side]["label_align"],
-                stub_direction=pin.side,
-            )
-            sch.add(cmd)
-        # Context exit auto-runs schCheck + dbSave
+    for pin in pins:
+        cls = _llm_classifications.get(pin.name)
+        if cls and cls.pin_type == "ground":
+            # Use local ground net from LLM classification
+            net_name = cls.ground_net or "gnd!"
+        elif cls is None and classify_pin_heuristic(pin) == "ground":
+            # Fallback: no LLM classification, use gnd!
+            net_name = "gnd!"
+        else:
+            net_name = pin.name
+        labeled_nets.append(net_name)
+        ops.append(label_term(
+            "DUT", pin.name, net_name,
+            rotation=cfg[pin.side]["label_rotation"],
+            justification=cfg[pin.side]["label_align"],
+            stub_direction=pin.side,
+        ))
 
+    batch_ops(lib, tb_cell, ops)
     print(f"[step4c] Added {len(labeled_nets)} labeled wire stubs on DUT pins: OK")
     return labeled_nets
 
@@ -467,60 +467,184 @@ def _source_load_position(
 
 
 def _resolve_param_value(value: str, vdd_value: float) -> str:
-    """Replace placeholder VDD with the actual voltage value."""
-    if value == "VDD":
-        return str(vdd_value)
-    return value
+    """Replace VDD placeholder with the actual voltage value.
+
+    Handles:
+      "VDD" → str(vdd_value)
+      "VDD/2" → computed division
+    Other values are returned as-is.
+    """
+    if "VDD" not in value:
+        return value
+    result = value.replace("VDD", str(vdd_value))
+    # Evaluate simple division like "0.9/2"
+    if "/" in result:
+        parts = result.split("/")
+        if len(parts) == 2:
+            try:
+                val = float(parts[0]) / float(parts[1])
+                return f"{val:g}"
+            except (ValueError, ZeroDivisionError):
+                pass
+    return result
+
+
+def _find_core_pin_name(pin_name: str, right_pins: dict[str, PinInfo]) -> str:
+    """Find the corresponding right-side (CORE) pin name for a left-side pin.
+
+    Search order:
+      1. {pin_name}_CORE in right_pins
+      2. Same name in right_pins (duplicate pin)
+      3. Default to {pin_name}_CORE
+    """
+    core_name = f"{pin_name}_CORE"
+    if core_name in right_pins:
+        return core_name
+    if pin_name in right_pins:
+        return pin_name
+    return core_name
+
+
+def _set_cdf_params(
+    lib: str,
+    tb_cell: str,
+    inst_name: str,
+    params: dict,
+    vdd_value: float,
+    *,
+    resolve_vdd: bool = False,
+) -> None:
+    """Set CDF parameters on an instance via setInstParams SKILL function."""
+    if not params:
+        return
+    pairs = []
+    for key, val in params.items():
+        pairs.append(f'"{key}"')
+        resolved = _resolve_param_value(val, vdd_value) if resolve_vdd else str(val)
+        pairs.append(f'"{resolved}"')
+    skill = (
+        f'setInstParams("{lib}" "{tb_cell}" "{inst_name}" '
+        f"list({' '.join(pairs)}))"
+    )
+    r = rb_exec(skill, timeout=30)
+    if "error" in r.lower():
+        print(f"[step4d] WARNING: CDF params failed for {inst_name}: {r}")
 
 
 def place_sources_and_loads(
-    client: VirtuosoClient,
     lib: str,
     tb_cell: str,
     pins: list[PinInfo],
     *,
     dut_xy: tuple[float, float] = (2.5, 0.0),
     vdd_value: float = 1.8,
-    ref_net: str = "gnd!",
+    client: Optional[VirtuosoClient] = None,
 ) -> list[str]:
-    """Place analogLib sources/loads for each DUT pin based on pad type rules.
+    """Place sources, loads, PVSS devices, and inner devices based on pin classification.
 
-    Uses label-based wiring: source/load terminals get the same net label
-    as the corresponding DUT pin, so Virtuoso auto-connects them.
+    Dual-side topology:
+      Phase 0: Collect ground domains → determine PVSS instances
+      Phase 1: Place PVSS ground devices (one per unique ground_net)
+      Phase 2: Place outer devices (left side) using AI classification
+      Phase 3: Place inner devices (right side) for CORE/duplicate pins
+      Phase 4: Set CDF parameters for all instances
 
-    Reference terminals (MINUS of sources, MINUS of loads) are tied to
-    ``ref_net`` (default ``gnd!`` — the global Virtuoso ground net).
-
-    Ground-type pins (VSS/GND) are skipped — they are already labeled
-    by ``add_wire_labels()`` and implicitly serve as the ground reference.
-
-    Two-phase:
-      1. SchematicEditor: place all instances + wire labels → save
-      2. setInstParams SKILL: configure CDF params on each instance → save
+    Falls back to PAD_RULES when no LLM classification is available.
 
     Returns list of instance names placed.
     """
     load_skill_file(str(_SKILL_DIR / "set_inst_params.il"))
     placed: list[str] = []
+    ops: list[str] = []
 
-    # ── Phase 1: place instances + labels ─────────────────
-    with client.schematic.edit(lib, tb_cell, mode="a") as sch:
-        # Global gnd symbol — place below-left, clear of source/load instances
+    # Build lookups
+    right_pins = {p.name: p for p in pins if p.side == "right"}
+    left_pins = [p for p in pins if p.side == "left"]
+    has_llm = bool(_llm_classifications)
+
+    # ── Phase 0: Collect ground domains ─────────────────
+    ground_nets: dict[str, str] = {}  # ground_net → PVSS instance name
+
+    if has_llm:
+        for pin in pins:
+            cls = _llm_classifications.get(pin.name)
+            if cls and cls.ground_net and cls.ground_net != "gnd!":
+                gnet = cls.ground_net
+                if gnet not in ground_nets:
+                    if gnet == "dgnd":
+                        ground_nets[gnet] = "GIOL"
+                    elif gnet == "dgnd_hv":
+                        ground_nets[gnet] = "PVSS2DGZ"
+                    else:
+                        block = gnet.replace("gnd_", "").replace("gnd", "")
+                        ground_nets[gnet] = f"PVSS_{block}" if block else "PVSS"
+
+    # ── Phase 1: Place PVSS ground devices ──────────────
+    if ground_nets:
+        # PVSS: analogLib/vdc, vdc=0, PLUS=local_ground, MINUS=gnd!
+        pvss_base_y = dut_xy[1] + min((p.y for p in pins), default=-5.0) - 4.0
+        pvss_x_start = dut_xy[0] - 4.0
+        pvss_spacing = 2.5
+
+        for i, (gnet, inst_name) in enumerate(sorted(ground_nets.items())):
+            px = pvss_x_start + i * pvss_spacing
+            py = pvss_base_y
+            ops.append(create_inst("analogLib", "vdc", "symbol", inst_name, px, py, "R0"))
+            placed.append(inst_name)
+            ops.append(label_term(inst_name, "PLUS", gnet))
+            ops.append(label_term(inst_name, "MINUS", "gnd!"))
+    else:
+        # Fallback: global gnd symbol (no LLM classifications)
         min_pin_y = min((p.y for p in pins), default=-5.0)
         gnd_x = dut_xy[0] - _LOAD_OFFSET - 2.0
         gnd_y = dut_xy[1] + min_pin_y - 3.0
-        sch.add(inst("analogLib", "gnd", "symbol", "GND0", gnd_x, gnd_y, "R0"))
+        ops.append(create_inst("analogLib", "gnd", "symbol", "GND0", gnd_x, gnd_y, "R0"))
         placed.append("GND0")
 
-        for pin in pins:
-            pad_type = _classify_pin(pin)
-            # ground pins are already labeled gnd! by add_wire_labels
+    # ── Phase 2: Place outer devices ────────────────────
+    # Only left-side (outer) pins get outer devices on the left
+    for pin in left_pins:
+        cls = _llm_classifications.get(pin.name)
+        px, py = _pin_position_in_tb(pin, dut_xy)
+
+        if cls:
+            # Use LLM classification
+            gnet = cls.ground_net or "gnd!"
+
+            # Ground and no_connect pins only get labels (from add_wire_labels)
+            if cls.pin_type in ("ground", "no_connect"):
+                continue
+
+            # Outer stimulus
+            if cls.stimulus:
+                inst_name = f"SRC_{pin.name}"
+                sx, sy = _source_load_position(px, py, "left")
+                inst_rot = "R90"
+                ops.append(create_inst("analogLib", cls.stimulus, "symbol",
+                                       inst_name, sx, sy, inst_rot))
+                placed.append(inst_name)
+                ops.append(label_term(inst_name, "PLUS", pin.name))
+                ops.append(label_term(inst_name, "MINUS", gnet))
+
+            # Outer load
+            if cls.load:
+                inst_name = f"LOAD_{pin.name}"
+                sx, sy = _source_load_position(px, py, "left", offset=_LOAD_OFFSET)
+                inst_rot = "R90"
+                ops.append(create_inst("analogLib", cls.load, "symbol",
+                                       inst_name, sx, sy, inst_rot))
+                placed.append(inst_name)
+                ops.append(label_term(inst_name, "PLUS", pin.name))
+                ops.append(label_term(inst_name, "MINUS", gnet))
+
+        else:
+            # Fallback: PAD_RULES
+            pad_type = classify_pin_heuristic(pin)
             if pad_type == "ground":
                 continue
             rule = PAD_RULES.get(pad_type)
             if rule is None:
                 continue
-            px, py = _pin_position_in_tb(pin, dut_xy)
 
             has_both = "source" in rule and "load" in rule
 
@@ -528,63 +652,124 @@ def place_sources_and_loads(
                 cfg = rule.get(role)
                 if cfg is None:
                     continue
-
                 inst_name = f"{'SRC' if role == 'source' else 'LOAD'}_{pin.name}"
-                # Place load further out to avoid overlap with source
                 if has_both and role == "load":
-                    sx, sy = _source_load_position(px, py, pin.side, offset=_LOAD_OFFSET)
+                    sx, sy = _source_load_position(px, py, "left", offset=_LOAD_OFFSET)
                 else:
-                    sx, sy = _source_load_position(px, py, pin.side)
-                # Rotate left/right instances horizontal to avoid vertical overlap
-                inst_rot = "R90" if pin.side in ("left", "right") else "R0"
-                sch.add(inst(cfg["lib"], cfg["cell"], "symbol",
-                             inst_name, sx, sy, inst_rot))
+                    sx, sy = _source_load_position(px, py, "left")
+                inst_rot = "R90"
+                ops.append(create_inst(cfg["lib"], cfg["cell"], "symbol",
+                                       inst_name, sx, sy, inst_rot))
                 placed.append(inst_name)
+                ops.append(label_term(inst_name, cfg["term"], pin.name))
+                ops.append(label_term(inst_name, cfg["ref_term"], "gnd!"))
 
-                # Label primary terminal → net = pin.name (connects to DUT)
-                sch.add(label_inst_term(
-                    inst_name, cfg["term"], pin.name,
-                    justification="lowerCenter", rotation="R0",
-                ))
-
-                # Label reference terminal → GND
-                sch.add(label_inst_term(
-                    inst_name, cfg["ref_term"], "GND",
-                    justification="lowerCenter", rotation="R0",
-                ))
-        # schCheck + dbSave on exit
-
-    # ── Phase 2: set CDF params ───────────────────────────
-    for pin in pins:
-        pad_type = _classify_pin(pin)
-        if pad_type == "ground":
+    # ── Phase 3: Place inner devices ────────────────────
+    # Left-side pins with inner_stimulus get inner devices on the right side,
+    # connected to the corresponding CORE/duplicate pin
+    for pin in left_pins:
+        cls = _llm_classifications.get(pin.name)
+        if not cls or not cls.inner_stimulus:
             continue
-        rule = PAD_RULES.get(pad_type)
-        if rule is None:
-            continue
-        for role in ("source", "load"):
-            cfg = rule.get(role)
-            if cfg is None:
-                continue
-            inst_name = f"{'SRC' if role == 'source' else 'LOAD'}_{pin.name}"
-            params = cfg.get("params", {})
-            if not params:
-                continue
-            # Build SKILL paramPairs list, resolving VDD placeholder
-            pairs = []
-            for key, val in params.items():
-                pairs.append(f'"{key}"')
-                pairs.append(f'"{_resolve_param_value(val, vdd_value)}"')
-            skill = (
-                f'setInstParams("{lib}" "{tb_cell}" "{inst_name}" '
-                f"list({' '.join(pairs)}))"
-            )
-            r = client.execute_skill(skill, timeout=30)
-            if r.errors:
-                print(f"[step4d] WARNING: CDF params failed for {inst_name}: {r.errors}")
 
-    n_src = len([p for p in placed if p != "GND0"])
-    print(f"[step4d] Placed 1 global ref + {n_src} source/load instances: OK")
+        # Find the corresponding right-side (CORE) pin
+        core_pin_name = _find_core_pin_name(pin.name, right_pins)
+        core_pin = right_pins.get(core_pin_name)
+
+        if core_pin:
+            cpx, cpy = _pin_position_in_tb(core_pin, dut_xy)
+        else:
+            # Fallback: estimate position on the right side
+            cpx = dut_xy[0] + abs(pin.x) + 1.5
+            cpy = dut_xy[1] + pin.y
+
+        gnet = cls.ground_net or "dgnd"
+
+        # Place inner stimulus
+        inst_name = f"INNER_{pin.name}"
+        sx, sy = _source_load_position(cpx, cpy, "right")
+        inst_rot = "R90"
+
+        if cls.inner_stimulus == "noConn":
+            # noConn: placed on inner side to prevent LVS warnings
+            ops.append(create_inst("analogLib", "noConn", "symbol",
+                                   inst_name, sx, sy, inst_rot))
+            placed.append(inst_name)
+            ops.append(label_term(inst_name, "PLUS", core_pin_name))
+        else:
+            # Standard device: vdc, idc, vpulse, cap
+            ops.append(create_inst("analogLib", cls.inner_stimulus, "symbol",
+                                   inst_name, sx, sy, inst_rot))
+            placed.append(inst_name)
+            ops.append(label_term(inst_name, "PLUS", core_pin_name))
+            ops.append(label_term(inst_name, "MINUS", gnet))
+
+        # Place inner load (for bidirectional pins)
+        if cls.inner_load:
+            load_inst_name = f"INNER_LOAD_{pin.name}"
+            lx, ly = _source_load_position(cpx, cpy, "right", offset=_LOAD_OFFSET)
+            ops.append(create_inst("analogLib", cls.inner_load, "symbol",
+                                   load_inst_name, lx, ly, inst_rot))
+            placed.append(load_inst_name)
+            ops.append(label_term(load_inst_name, "PLUS", core_pin_name))
+            ops.append(label_term(load_inst_name, "MINUS", gnet))
+
+    batch_ops(lib, tb_cell, ops, timeout=120)
+
+    # ── Phase 4: Set CDF parameters ────────────────────
+    for pin in left_pins:
+        cls = _llm_classifications.get(pin.name)
+
+        if cls:
+            if cls.pin_type in ("ground", "no_connect"):
+                continue
+
+            # Outer stimulus params
+            if cls.stimulus and cls.stimulus_params:
+                _set_cdf_params(lib, tb_cell, f"SRC_{pin.name}",
+                                cls.stimulus_params, vdd_value)
+
+            # Outer load params
+            if cls.load and cls.load_params:
+                _set_cdf_params(lib, tb_cell, f"LOAD_{pin.name}",
+                                cls.load_params, vdd_value)
+
+            # Inner stimulus params (skip noConn — no CDF params)
+            if cls.inner_stimulus and cls.inner_params and cls.inner_stimulus != "noConn":
+                _set_cdf_params(lib, tb_cell, f"INNER_{pin.name}",
+                                cls.inner_params, vdd_value)
+
+            # Inner load params
+            if cls.inner_load and cls.inner_load_params:
+                _set_cdf_params(lib, tb_cell, f"INNER_LOAD_{pin.name}",
+                                cls.inner_load_params, vdd_value)
+
+        else:
+            # Fallback: PAD_RULES
+            pad_type = classify_pin_heuristic(pin)
+            if pad_type == "ground":
+                continue
+            rule = PAD_RULES.get(pad_type)
+            if rule is None:
+                continue
+            for role in ("source", "load"):
+                cfg = rule.get(role)
+                if cfg is None:
+                    continue
+                inst_name = f"{'SRC' if role == 'source' else 'LOAD'}_{pin.name}"
+                params = cfg.get("params", {})
+                if params:
+                    _set_cdf_params(lib, tb_cell, inst_name, params,
+                                    vdd_value, resolve_vdd=True)
+
+    # Set PVSS params (vdc=0 for all ground devices)
+    for gnet, inst_name in ground_nets.items():
+        _set_cdf_params(lib, tb_cell, inst_name, {"vdc": "0"}, vdd_value)
+
+    n_pvss = len(ground_nets) or 1  # 1 for the fallback GND0
+    n_outer = sum(1 for p in placed if p.startswith(("SRC_", "LOAD_")))
+    n_inner = sum(1 for p in placed if p.startswith("INNER_"))
+    print(f"[step4d] Placed {n_pvss} PVSS + {n_outer} outer + {n_inner} inner instances: OK")
     return placed
 
 
@@ -642,7 +827,7 @@ def run_sim_flow(
     tb_cell = create_tb_cellview(client, lib, primary_cell)
 
     # Step 4a: Place DUT instance
-    dut_ok = place_dut(client, lib, tb_cell, primary_cell)
+    dut_ok = place_dut(lib, tb_cell, primary_cell)
 
     # Step 4b: Extract pin info (from redistributed symbol)
     pins = extract_dut_pins(client, lib, primary_cell)
@@ -654,11 +839,11 @@ def run_sim_flow(
     _load_llm_classifications(run_dir)
 
     # Step 4c: Add wire labels on DUT pins
-    labels = add_wire_labels(client, lib, tb_cell, pins) if pins else []
+    labels = add_wire_labels(lib, tb_cell, pins) if pins else []
 
     # Step 4d: Place sources & loads based on pin classification
     sources = place_sources_and_loads(
-        client, lib, tb_cell, pins, vdd_value=vdd_value,
+        lib, tb_cell, pins, vdd_value=vdd_value, client=client,
     ) if pins else []
 
     # Step 5: Run simulation (optional)
