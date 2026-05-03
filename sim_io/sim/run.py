@@ -500,9 +500,18 @@ def parse_results(
             # Power pin: add current + power measurements
             if pad_type == "power":
                 src_name = f"SRC_{pin.name}"
-                i_key = _find_signal(data, f"{src_name}:PLUS", dut_instance)
-                if i_key is None:
-                    i_key = _find_signal(data, f"{src_name}", dut_instance)
+                # Spectre PSF uses various formats for branch currents
+                i_candidates = [
+                    f"{src_name}:p",        # Spectre short form (PLUS)
+                    f"{src_name}:PLUS",     # Full terminal name
+                    src_name,               # Total source current
+                    f"{src_name}.p",        # Dot notation variant
+                ]
+                i_key = None
+                for cand in i_candidates:
+                    i_key = _find_signal(data, cand, dut_instance)
+                    if i_key is not None:
+                        break
 
                 if i_key and i_key in data:
                     if analysis == "tran":

@@ -140,11 +140,27 @@ def _auto_generate_outputs(
                    session=session)
         n_voltage += 1
 
-        # 2. Voltage spec boundaries — digital pins must swing rail-to-rail
+        # 2. Voltage spec boundaries for digital pins
+        #    set_spec on a waveform (net) checks ALL time points — wrong for
+        #    digital signals that transition.  Instead, add scalar OCEAN
+        #    expressions (ymax/ymin) and set spec on those.
         if pad_type in _DIGITAL_PIN_TYPES:
-            set_spec(client, pin.name, tname,
-                     gt=str(round(0.1 * vdd_value, 4)),
-                     lt=str(round(vdd_value * 1.01, 4)),
+            vmax_name = f"vmax_{pin.name}"
+            vmax_expr = _escape_ocean_expr(f'ymax(v("{sig_path}"))')
+            add_output(client, vmax_name, tname,
+                       output_type="point", expr=vmax_expr,
+                       session=session)
+            set_spec(client, vmax_name, tname,
+                     gt=str(round(0.9 * vdd_value, 4)),
+                     session=session)
+
+            vmin_name = f"vmin_{pin.name}"
+            vmin_expr = _escape_ocean_expr(f'ymin(v("{sig_path}"))')
+            add_output(client, vmin_name, tname,
+                       output_type="point", expr=vmin_expr,
+                       session=session)
+            set_spec(client, vmin_name, tname,
+                     lt=str(round(0.1 * vdd_value, 4)),
                      session=session)
 
         # 3. Power pin: current + power expressions with specs
@@ -153,7 +169,7 @@ def _auto_generate_outputs(
 
             # Current through VDD source
             i_name = f"I_{pin.name}"
-            i_expr = _escape_ocean_expr(f'i(\\"{src_name}/PLUS\\")')
+            i_expr = _escape_ocean_expr(f'i("{src_name}/PLUS")')
             add_output(client, i_name, tname,
                        output_type="point", expr=i_expr,
                        session=session)
@@ -166,7 +182,7 @@ def _auto_generate_outputs(
             # Power = V × I
             p_name = f"P_{pin.name}"
             p_expr = _escape_ocean_expr(
-                f'v(\\"{sig_path}\\") * i(\\"{src_name}/PLUS\\")'
+                f'v("{sig_path}") * i("{src_name}/PLUS")'
             )
             add_output(client, p_name, tname,
                        output_type="point", expr=p_expr,

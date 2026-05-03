@@ -13,6 +13,7 @@ Defines SimDeckConfig (the complete simulation configuration) and provides:
 from __future__ import annotations
 
 import json
+import os
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -638,13 +639,16 @@ def sim_config_from_site(
     mf = model_file or TSMC28_MODEL_FILE
     secs = sections or TSMC28_SECTIONS
 
+    # IO pad model — only include if the env var is set (PDK-specific)
+    io_model_path = os.getenv("SIM_PDK_IO_SPECTRE_INCLUDE", "")
+    model_includes = [ModelInclude(path=mf, section=s) for s in secs]
+    if io_model_path:
+        model_includes.append(ModelInclude(path=io_model_path, section=""))
+
     return SimDeckConfig(
         global_ground="0",
         design_vars=[DesignVar(name="VDD", expression=str(vdd_value))],
-        model_includes=[
-            *(ModelInclude(path=mf, section=s) for s in secs),
-            ModelInclude(path=TSMC28_IO_MODEL_FILE, section=""),
-        ],
+        model_includes=model_includes,
         analyses=[
             AnalysisSpec(name="dc", sweep=SweepSpec(
                 param="VDD", start="0", stop=str(vdd_value * 1.5), lin="50"
