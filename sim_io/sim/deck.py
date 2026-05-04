@@ -104,12 +104,23 @@ def _build_deck_from_deck_config(
     # 4. Model includes
     for mi in cfg.model_includes:
         is_spice = mi.path.endswith(".spi") or mi.path.endswith(".sp")
+        is_hspice_lib = mi.path.endswith(".l")
         section_str = f" section={mi.section}" if mi.section else ""
-        if is_spice:
+
+        if is_hspice_lib:
+            # HSPICE library format: .lib "path" section
             lines.append("simulator lang=spice")
-        lines.append(f'include "{mi.path}"{section_str}')
-        if is_spice:
+            section_part = f" {mi.section}" if mi.section else ""
+            lines.append(f'.lib "{mi.path}"{section_part}')
             lines.append("simulator lang=spectre")
+        elif is_spice:
+            # SPICE format: .include "path" (no section support)
+            lines.append("simulator lang=spice")
+            lines.append(f'.include "{mi.path}"')
+            lines.append("simulator lang=spectre")
+        else:
+            # Spectre format: include "path" section=X
+            lines.append(f'include "{mi.path}"{section_str}')
     if cfg.model_includes:
         lines.append("")
 

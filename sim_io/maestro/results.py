@@ -1,0 +1,118 @@
+"""Parse MaestroSimResult outputs into Python-accessible measurements dict.
+
+Converts the Maestro per-point output table (from read_results()) into the
+same format that sim_io.sim.run.parse_results() produces for Spectre, so
+verify_results() in sim_io.sim.verify can be called unchanged.
+
+Output name → pin metric mapping (set up by _auto_generate_outputs in setup.py):
+  vmax_<pin>  →  pins[pin]["vmax"]   (ymax of transient voltage)
+  vmin_<pin>  →  pins[pin]["vmin"]   (ymin of transient voltage)
+  I_<pin>     →  pins[pin]["iavg"]   (branch current, taken as abs)
+  P_<pin>     →  pins[pin]["pavg"]   (v * i power expression, taken as abs)
+"""
+
+from __future__ import annotations
+
+from sim_io.maestro.run import MaestroSimResult
+from sim_io.pin_types import PinInfo, classify_pin_heuristic
+
+
+def parse_maestro_measurements(
+    mae_result: MaestroSimResult,
+    pins: list[PinInfo],
+    *,
+    classifications: dict | None = None,
+    vdd: float = 1.8,
+) -> dict:
+    """Convert MaestroSimResult.points → measurements.json-compatible dict.
+
+    Parameters
+    ----------
+    mae_result     : result from run_maestro_sim()
+    pins           : pin list from phase_a (PinInfo objects)
+    classifications: LLM pin_classifications dict {pin_name: PinClassification}
+    vdd            : supply voltage (for context, not used in mapping)
+
+    Returns a dict with structure::
+
+        {
+          "status": "ok",
+          "analysis": "tran",
+          "source": "maestro",
+          "num_pins_measured": <int>,
+          "num_pins_total": <int>,
+          "pins": {
+            "<pin_name>": {
+              "pad_type": "power" | "digital_input" | ...,
+              "vmax": <float>,      # present for digital/clock/reset pins
+              "vmin": <float>,
+              "vpp":  <float>,
+              "iavg": <float>,      # present for power pins (abs)
+              "pavg": <float>,      # present for power pins (abs)
+            },
+            ...
+          }
+        }
+    """
+    if not mae_result.sim_ok or not mae_result.points:
+        return {
+            "status": "error",
+            "errors": ["Maestro simulation failed or produced no result points"],
+        }
+
+    # Flatten all per-point scalar outputs into {output_name: float}.
+    # Single Run mode has exactly one point; sweeps have more — take first.
+    outputs: dict[str, float] = {}
+    for pt in mae_result.points:
+        for out_name, info in (pt.get("outputs") or {}).items():
+            val_str = (info.get("value", "") if isinstance(info, dict) else str(info)).strip()
+            if not val_str or val_str.lower() in ("nil", "n/a", "---", ""):
+                continue
+            try:
+                outputs[out_name] = float(val_str)
+            except (ValueError, TypeError):
+                pass
+        break  # only use first point for Single Run
+
+    pin_measurements: dict[str, dict] = {}
+    for pin in pins:
+        pad_type = (
+            classifications[pin.name].pin_type
+            if classifications and pin.name in classifications
+            else classify_pin_heuristic(pin)
+        )
+        if pad_type == "ground":
+            continue
+
+        m: dict = {"pad_type": pad_type}
+
+        vmax = outputs.get(f"vmax_{pin.name}")
+        vmin = outputs.get(f"vmin_{pin.name}")
+        if vmax is not None:
+            m["vmax"] = vmax
+        if vmin is not None:
+            m["vmin"] = vmin
+        if vmax is not None and vmin is not None:
+            m["vpp"] = vmax - vmin
+
+        iavg = outputs.get(f"I_{pin.name}")
+        pavg = outputs.get(f"P_{pin.name}")
+        if iavg is not None:
+            m["iavg"] = abs(iavg)
+        if pavg is not None:
+            m["pavg"] = abs(pavg)
+
+        if not (set(m.keys()) - {"pad_type"}):
+            m["error"] = "no scalar outputs in Maestro results for this pin"
+
+        pin_measurements[pin.name] = m
+
+    n_ok = sum(1 for v in pin_measurements.values() if "error" not in v)
+    return {
+        "status": "ok",
+        "analysis": "tran",
+        "source": "maestro",
+        "num_pins_measured": n_ok,
+        "num_pins_total": len(pins),
+        "pins": pin_measurements,
+    }

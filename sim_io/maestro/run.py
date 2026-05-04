@@ -211,8 +211,12 @@ def _export_waveforms(
                 analysis=analysis,
                 history=history,
             )
-            result.waveform_paths.append(local_path)
-            print(f"[maestro-sim] Waveform: {sig} → {local_path}")
+            # Verify file actually exists — download_file doesn't raise on SCP failure
+            if Path(local_path).exists() and Path(local_path).stat().st_size > 0:
+                result.waveform_paths.append(local_path)
+                print(f"[maestro-sim] Waveform: {sig} → {local_path}")
+            else:
+                print(f"[maestro-sim] WARNING: waveform file empty/missing for {sig}")
         except Exception as e:
             print(f"[maestro-sim] WARNING: waveform export failed for {sig}: {e}")
 

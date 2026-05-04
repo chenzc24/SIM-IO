@@ -501,12 +501,12 @@ def generate_apply_skill(
             lines.append(
                 f'  dbCreateLine(cv list("device" "drawing")'
                 f' list(list({wx1:g} {wy1:g}) list({wx2:g} {wy2:g})))')
-            # New label (centered)
+            # New label (right-aligned for right side)
             lx, ly = pin.label_x, pin.label_y
             lines.append(
                 f'  dbCreateLabel(cv list("pin" "label")'
                 f' list({lx:g} {ly:g}) "{name}"'
-                f' "lowerCenter" "R0" "stick" 0.0625)')
+                f' "centerRight" "R0" "stick" 0.125)')
 
         elif pin.is_core:
             # ── Right-side CORE: move pin figure + create wire + move label ──
@@ -532,14 +532,14 @@ def generate_apply_skill(
             lines.append(
                 f'  dbCreateLine(cv list("device" "drawing")'
                 f' list(list({wx1:g} {wy1:g}) list({wx2:g} {wy2:g})))')
-            # Move label + fix justification for right side
+            # Move label + fix justification + font size for right side
             lx, ly = pin.label_x, pin.label_y
             lines.append(
                 f'  lbl = car(setof(s cv~>shapes'
                 f' s~>objType == "label" && s~>theLabel == "{name}"'
                 f' && abs(car(s~>xy) - {olx:g}) < 0.01'
                 f' && abs(cadr(s~>xy) - {oly:g}) < 0.01))')
-            lines.append(f'  when(lbl lbl~>xy = list({lx:g} {ly:g}) lbl~>justify = "lowerCenter")')
+            lines.append(f'  when(lbl lbl~>xy = list({lx:g} {ly:g}) lbl~>justify = "centerRight" lbl~>height = 0.125)')
 
         else:
             # ── Left-side non-CORE: move pin figure + create wire + move label ──
@@ -565,14 +565,14 @@ def generate_apply_skill(
             lines.append(
                 f'  dbCreateLine(cv list("device" "drawing")'
                 f' list(list({wx1:g} {wy1:g}) list({wx2:g} {wy2:g})))')
-            # Move label
+            # Move label + fix justification + font size for left side
             lx, ly = pin.label_x, pin.label_y
             lines.append(
                 f'  lbl = car(setof(s cv~>shapes'
                 f' s~>objType == "label" && s~>theLabel == "{name}"'
                 f' && abs(car(s~>xy) - {olx:g}) < 0.01'
                 f' && abs(cadr(s~>xy) - {oly:g}) < 0.01))')
-            lines.append(f'  when(lbl lbl~>xy = list({lx:g} {ly:g}) lbl~>justify = "lowerCenter")')
+            lines.append(f'  when(lbl lbl~>xy = list({lx:g} {ly:g}) lbl~>justify = "centerLeft" lbl~>height = 0.125)')
 
     # Save + return
     lines.append(f'  dbSave(cv)')

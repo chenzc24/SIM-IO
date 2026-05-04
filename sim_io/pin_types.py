@@ -69,7 +69,7 @@ class PinClassification:
     inner_params: Optional[dict] = None     # Inner device params
     inner_load: Optional[str] = None        # Inner load cell (for bidirectional): cap, res
     inner_load_params: Optional[dict] = None  # Inner load params
-    ground_net: Optional[str] = None        # Local ground net (e.g. gnd_DAT, dgnd)
+    ground_net: Optional[str] = None        # Ground domain for internal grouping (e.g. gnd_DAT, dgnd) — NOT used as schematic label
 
 
 @dataclass
@@ -200,14 +200,17 @@ SIDE_CONFIGS = {
         "label_offset_x": -0.25, "label_offset_y": 0.0,
         "label_align": "lowerCenter", "label_rotation": "R0",
     },
+    # After redistribution, all top/bottom pins become left-side pins.
+    # These aliases ensure correct horizontal label settings if any code
+    # still produces a "top" or "bottom" side classification.
     "top": {
-        "extend_x": 0.0, "extend_y": 0.750,
-        "label_offset_x": 0.0, "label_offset_y": 0.25,
+        "extend_x": -0.750, "extend_y": 0.0,
+        "label_offset_x": -0.25, "label_offset_y": 0.0,
         "label_align": "lowerCenter", "label_rotation": "R0",
     },
     "bottom": {
-        "extend_x": 0.0, "extend_y": -0.750,
-        "label_offset_x": 0.0, "label_offset_y": -0.25,
+        "extend_x": -0.750, "extend_y": 0.0,
+        "label_offset_x": -0.25, "label_offset_y": 0.0,
         "label_align": "lowerCenter", "label_rotation": "R0",
     },
 }

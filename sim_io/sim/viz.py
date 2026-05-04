@@ -276,18 +276,59 @@ def plot_tran(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    sigs = signals or list(tran.signals.keys())[:6]
+    if signals:
+        sigs = signals
+    else:
+        # Filter out constant signals (ground nets, static supplies)
+        # and prioritize signals with significant variation
+        varying_sigs = []
+        static_sigs = []
+        for sig_name, sig_data in tran.signals.items():
+            if len(sig_data) < 2:
+                continue
+            sig_range = max(sig_data) - min(sig_data)
+            if sig_range > 1e-6:  # non-constant
+                varying_sigs.append((sig_name, sig_range))
+            else:
+                static_sigs.append(sig_name)
+        # Sort by range (most varying first)
+        varying_sigs.sort(key=lambda x: x[1], reverse=True)
+        sigs = [s[0] for s in varying_sigs[:12]]
+        # Add a few static signals if space
+        for s in static_sigs[:3]:
+            if len(sigs) < 15:
+                sigs.append(s)
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    for sig in sigs:
-        if sig in tran.signals:
-            ax.plot(tran.time, tran.signals[sig], label=sig, linewidth=1.2)
+    n_sigs = len(sigs)
+    n_cols = min(3, n_sigs) if n_sigs > 6 else 1
+    n_rows = (n_sigs + n_cols - 1) // n_cols if n_cols > 1 else 1
 
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Voltage (V)")
-    ax.set_title(title)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    if n_cols == 1:
+        fig, ax = plt.subplots(figsize=(10, max(4, n_sigs * 0.8)))
+        for sig in sigs:
+            if sig in tran.signals:
+                ax.plot(tran.time, tran.signals[sig], label=sig, linewidth=1.2)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Voltage (V)")
+        ax.set_title(title)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+    else:
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 3 * n_rows), squeeze=False)
+        for idx, sig in enumerate(sigs):
+            row, col = idx // n_cols, idx % n_cols
+            ax = axes[row][col]
+            if sig in tran.signals:
+                ax.plot(tran.time, tran.signals[sig], label=sig, linewidth=1.0)
+                ax.set_title(sig, fontsize=9)
+                ax.set_ylabel("V", fontsize=8)
+                ax.grid(True, alpha=0.3)
+                ax.tick_params(labelsize=7)
+        # Hide unused subplots
+        for idx in range(len(sigs), n_rows * n_cols):
+            row, col = idx // n_cols, idx % n_cols
+            axes[row][col].set_visible(False)
+        fig.tight_layout()
 
     out = Path(output_path)
     fig.savefig(out, format="svg", bbox_inches="tight")

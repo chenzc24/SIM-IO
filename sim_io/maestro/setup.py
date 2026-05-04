@@ -105,7 +105,7 @@ _DIGITAL_PIN_TYPES = frozenset({
     "clock", "reset",
 })
 
-_SKIP_PIN_TYPES = frozenset({"ground", "no_connect", "reference"})
+_SKIP_PIN_TYPES = frozenset({"ground", "no_connect", "reference", "bias_current"})
 
 
 def _auto_generate_outputs(
@@ -114,24 +114,39 @@ def _auto_generate_outputs(
     pins: list[PinInfo],
     vdd_value: float,
     session: str,
-) -> None:
+    classifications: dict[str, "PinClassification"] | None = None,
+) -> list[str]:
     """Add voltage + current + power outputs with spec boundaries.
 
     Per-pin outputs based on classification:
       - power: voltage net + current expression + power expression + specs
       - digital/clock/reset: voltage net + spec boundaries
       - analog: voltage net (no spec — context-dependent)
-      - ground/no_connect/reference: skipped
+      - ground/no_connect/reference/bias_current: skipped
+
+    Returns list of source instance names whose branch currents need
+    to be saved (e.g. ["SRC_VDD"]) so the caller can add save signals.
     """
     n_voltage = 0
     n_current = 0
     n_power = 0
+    current_sources: list[str] = []
 
     for pin in pins:
-        pad_type = classify_pin_heuristic(pin)
+        # Use LLM classification if available, else heuristic
+        if classifications and pin.name in classifications:
+            cls = classifications[pin.name]
+            pad_type = cls.pin_type
+            ground_net = cls.ground_net or "--GND"
+        else:
+            pad_type = classify_pin_heuristic(pin)
+            ground_net = "--GND"
+
         if pad_type in _SKIP_PIN_TYPES:
             continue
 
+        # Use actual net name, not pin name
+        # For ground pins already skipped, remaining pins use pin.name as net
         sig_path = f"/{pin.name}"
 
         # 1. Voltage output — all non-ground pins
@@ -145,8 +160,11 @@ def _auto_generate_outputs(
         #    digital signals that transition.  Instead, add scalar OCEAN
         #    expressions (ymax/ymin) and set spec on those.
         if pad_type in _DIGITAL_PIN_TYPES:
+            # Use ?result "tran" so ymax/ymin only evaluate on transient
+            # waveform data.  Without this, DC sweep returns a scalar and
+            # ymax(nil) causes "_ymaxMethod: can't handle" eval errors.
             vmax_name = f"vmax_{pin.name}"
-            vmax_expr = _escape_ocean_expr(f'ymax(v("{sig_path}"))')
+            vmax_expr = _escape_ocean_expr(f'ymax(v("{sig_path}" ?result "tran"))')
             add_output(client, vmax_name, tname,
                        output_type="point", expr=vmax_expr,
                        session=session)
@@ -155,7 +173,7 @@ def _auto_generate_outputs(
                      session=session)
 
             vmin_name = f"vmin_{pin.name}"
-            vmin_expr = _escape_ocean_expr(f'ymin(v("{sig_path}"))')
+            vmin_expr = _escape_ocean_expr(f'ymin(v("{sig_path}" ?result "tran"))')
             add_output(client, vmin_name, tname,
                        output_type="point", expr=vmin_expr,
                        session=session)
@@ -163,26 +181,36 @@ def _auto_generate_outputs(
                      lt=str(round(0.1 * vdd_value, 4)),
                      session=session)
 
-        # 3. Power pin: current + power expressions with specs
-        if pad_type == "power":
+        # 3. Power pin: current + power expressions with specs.
+        # Only for left-side (outer) pins that have a SRC_ device placed.
+        # Right-side (CORE) power pins have no SRC_ device in the netlist.
+        if pad_type == "power" and getattr(pin, "side", "left") == "left":
             src_name = f"SRC_{pin.name}"
+            current_sources.append(src_name)
 
             # Current through VDD source
             i_name = f"I_{pin.name}"
-            i_expr = _escape_ocean_expr(f'i("{src_name}/PLUS")')
+            # average(abs()) reduces the tran waveform to a scalar — required
+            # for output_type="point". Terminal :p = PLUS (Spectre PSF lowercase).
+            i_expr = _escape_ocean_expr(
+                f'average(abs(i("{src_name}:p" ?result "tran")))'
+            )
             add_output(client, i_name, tname,
                        output_type="point", expr=i_expr,
                        session=session)
             set_spec(client, i_name, tname,
                      gt="0",
+                     session=session)
+            set_spec(client, i_name, tname,
                      lt=str(_DEFAULT_I_MAX),
                      session=session)
             n_current += 1
 
-            # Power = V × I
+            # Average power = mean(|V × I|) over tran.
+            # Both v() and i() need ?result "tran" to avoid multi-analysis mismatch.
             p_name = f"P_{pin.name}"
             p_expr = _escape_ocean_expr(
-                f'v("{sig_path}") * i("{src_name}/PLUS")'
+                f'average(abs(v("{sig_path}" ?result "tran") * i("{src_name}:p" ?result "tran")))'
             )
             add_output(client, p_name, tname,
                        output_type="point", expr=p_expr,
@@ -194,6 +222,7 @@ def _auto_generate_outputs(
 
     print(f"[maestro] Auto-generated outputs: {n_voltage} voltage, "
           f"{n_current} current, {n_power} power")
+    return current_sources
 
 
 # ── Analysis Options Builder ───────────────────────────────────
@@ -291,6 +320,9 @@ def _build_sim_option_alist(opts: SimOptions) -> str:
         f'("gmin" "{opts.gmin}")',
         f'("tnom" "{opts.tnom}")',
         f'("pivrel" "{opts.pivrel}")',
+        # Force ASCII PSF output so openResults() can access waveforms
+        # from the PSF directory after the simulation completes.
+        '("format" "psfascii")',
     ]
     for k, v in opts.extra.items():
         parts.append(f'("{k}" "{v}")')
@@ -358,6 +390,7 @@ def build_maestro_setup(
     pins: list[PinInfo] | None = None,
     test_name: str = "",
     auto_close: bool = True,
+    classifications: dict[str, "PinClassification"] | None = None,
 ) -> str:
     """Build a complete Maestro test setup from SimDeckConfig.
 
@@ -384,6 +417,21 @@ def build_maestro_setup(
     print(f" Maestro Setup: {lib}/{tb_cell}")
     print(f" Test: {tname}")
     print(f"{'='*60}\n")
+
+    # Delete existing maestro view so the new setup starts completely fresh.
+    # Without this, re-runs accumulate stale outputs from prior configurations.
+    # Use ddGetObj (disk lookup, no open required) + dbDeleteCellView.
+    r_del = client.execute_skill(
+        f'let((obj path) '
+        f'obj = ddGetObj("{lib}" "{tb_cell}" "maestro") '
+        f'when(obj '
+        f'  path = obj~>readPath '
+        f'  sh(strcat("rm -rf " path)) '
+        f'  ddDeleteRep(obj)) t)',
+        timeout=60,
+    )
+    if r_del.errors:
+        print(f"[maestro] NOTE: maestro view delete: {r_del.errors} (ok if first run)")
 
     # Step 1: Ensure maestro view exists on disk + get session
     # Reuse the session from ensure_maestro_view to avoid opening
@@ -421,9 +469,9 @@ def build_maestro_setup(
 
         # Step 7: Model files + save signals config
         # CRITICAL: simulation fails without model files.
-        # Also set saveSignals to "allpub" (equivalent to Spectre's
-        # "saveOptions options save=allpub") so raw waveforms are
-        # available for any signal, not just declared outputs.
+        # Also set saveSignals — "allpub" saves public node voltages;
+        # "all" also saves branch currents needed for i("SRC_xxx/PLUS")
+        # current/power OCEAN expressions.
         env_parts: list[str] = []
         if config.model_includes:
             model_entries = []
@@ -433,10 +481,17 @@ def build_maestro_setup(
             model_entries_str = " ".join(model_entries)
             env_parts.append(f'("modelFiles" ({model_entries_str}))')
 
-        # Save config: allpub = save all public signals
-        # This ensures raw PSF data is available for waveform export
-        # even if the signal isn't declared as a Maestro output.
+        # Determine save mode: if any power pin exists (needs current data),
+        # use "all" to include branch currents; otherwise "allpub" (voltages).
+        has_power = any(
+            (classifications and pin.name in classifications
+             and classifications[pin.name].pin_type == "power")
+            or (not classifications and classify_pin_heuristic(pin) == "power")
+            for pin in (pins or [])
+        )
         save_val = config.save_default or "allpub"
+        if has_power and save_val == "allpub":
+            save_val = "all"
         env_parts.append(f'("saveSignals" "{save_val}")')
 
         # switchViewList: hierarchy traversal order for the netlister.
@@ -449,6 +504,11 @@ def build_maestro_setup(
         env_parts.append(
             '("switchViewList" "hspiceD spectre cmos_sch schematic veriloga")'
         )
+
+        # Force ASCII PSF output so openResults() can read waveforms after the run.
+        # Without this Maestro stores results only in .rdb (binary) which is
+        # inaccessible from standalone OCEAN functions like v() / getData().
+        env_parts.append('("psfFormat" "psfascii")')
 
         env_alist = "(" + " ".join(env_parts) + ")"
         set_env_option(client, tname, env_alist, session=session)
@@ -493,9 +553,12 @@ def build_maestro_setup(
                     except ValueError:
                         pass
                     break
-            _auto_generate_outputs(
+            current_sources = _auto_generate_outputs(
                 client, tname, pins or [], vdd, session,
+                classifications=classifications,
             )
+            if current_sources:
+                print(f"[maestro] Current save signals needed for: {current_sources}")
 
         # Step 11: Set run mode
         set_current_run_mode(

@@ -1,178 +1,187 @@
-# Simulation Configuration Rules
+# IO Ring Simulation Configuration Rules
 
-This document defines the rules for generating a Spectre simulation deck configuration.
-The LLM reads this along with `sim_config_input.json` and produces `sim_config.json`.
+Rules for generating a Spectre simulation deck for IO Ring testbenches.
+The LLM reads this file plus `pin_info.json` / `pin_classifications.json` and produces `sim_config.json`.
 
-## Spectre Deck Structure
+---
 
-A complete Spectre deck has these sections in order:
+## Core Rules (Non-Negotiable)
 
+1. **No design variables.** Never emit `design_vars` or `parameters`. All voltage/current values come
+   directly from `pin_classifications.json` stimulus params — they are already fixed numbers.
+
+2. **No AC analysis.** IO Ring cells do not need frequency response. Only DC and transient.
+
+3. **Always run both DC and transient.** DC first (sets operating point), transient second.
+   This applies to both analog and digital IO cells — no exceptions.
+
+4. **Power is always calculated from transient.** Use `integ(pwr(...), t_start, tstop) / tstop`
+   to get average power per device. Never estimate from DC.
+
+---
+
+## Analysis Order and Settings
+
+### 1. DC Operating Point
+
+```spectre
+dcOp dc
 ```
-simulator lang=spectre
-global 0
-parameters VDD=1.8
-include "model_file.scs" section=section_name
-simulatorOptions options reltol=1e-4 ...
-info what=models where=rawfile
-dc dc param=VDD start=0 stop=3 lin=100
-save /VOUT /VIP /VIN
-saveOptions options save=allpub
+
+- **No sweep parameter.** Just an operating point — all sources are at their DC values.
+- Runs first to establish initial conditions for transient.
+- Applied to both analog and digital cells.
+
+### 2. Transient
+
+```spectre
+tran tran stop=<tstop> errpreset=moderate
 ```
 
-## Design Variables
+- `stop`: should be long enough to see at least 10 full cycles of the slowest `vpulse` stimulus.
+  Compute from stimulus params: `tstop = 10 × max(per)` across all `vpulse` sources.
+  Minimum: `100n`. Maximum: `10u`. Round to a clean value (e.g. `500n`, `1u`).
+- `errpreset=moderate` for digital-dominant cells; `errpreset=conservative` for analog-dominant.
+  A cell is "analog-dominant" if more than half its non-ground pins are `analog_*`, `reference`, or `bias_current` type.
+- `maxstep`: set to `tstop / 1000` (Spectre default is often too coarse for IO switching).
 
-Syntax: `parameters NAME=VALUE NAME2=VALUE2`
-
-- `VDD` is the most common design variable, used by voltage sources like `vsource dc=VDD`
-- The value should match the `vdd_value` from the input
-- Other variables may appear in instance parameters (check the netlist)
+---
 
 ## Model Includes
 
-TSMC28 uses a single model file with multiple sections. Always include at minimum:
+**Do not specify model includes in `sim_config.json`.** Leave `model_includes: []`.
 
-| Section | Purpose | Required? |
-|---------|---------|-----------|
-| `pre_simu` | Pre-simulation setup, model definitions | **Always** |
-| `noise_worst` | Noise models | For noise/ac analysis |
-| `ttmacro_mos_moscap` | TT corner MOS + MOSCAP models | **Always** |
-| `tt_res_bip_dio_disres` | TT corner resistor/bipolar/diode | If circuit has R/B/D |
-| `tt_mom` | MOM capacitor models | If circuit has MOM caps |
-| `tt_ind_jvar` | Inductor/junction varactor models | If circuit has inductors |
-| `tt_r_metal` | Metal resistor models | For parasitic-aware sim |
+Phase B injects the full include list automatically from `.env` after loading your config.
+The generated deck will contain these lines (one `include` per section):
 
-The model file path is provided in `pdk_info.model_file` of the input.
-
-## Analysis Types
-
-### DC Analysis
+```spectre
+include "/home/process/tsmc28n/PDK_mmWave/iPDK_CRN28HPC+ULL_v1.8_2p2a_20190531/tsmcN28/../models/spectre/crn28ull_1d8_elk_v1d8_2p2_shrink0d9_embedded_usage.scs" section=pre_simu
+include "..." section=ttmacro_mos_moscap
+include "..." section=tt_res_bip_dio_disres
+include "..." section=tt_mom
+include "..." section=tt_ind_jvar
+include "..." section=tt_r_metal
+include "..." section=noise_worst
+simulator lang=spice
+.include "/home/process/tsmc28n/IO/tphn28hpcpgv18_170a/0971001_20180621/tphn28hpcpgv18_110a_spi/TSMCHOME/digital/Back_End/spice/tphn28hpcpgv18_110a/tphn28hpcpgv18.spi"
+simulator lang=spectre
 ```
-dc dc param=VDD start=0 stop=3 lin=100
-```
-- Used for: DC operating point, DC sweep of supply voltage
-- `param`: the design variable or parameter to sweep
-- `start/stop`: sweep range
-- `lin`: number of linear steps
-- When to use: amplifiers (DC gain), digital cells (transfer curve)
 
-### Transient Analysis
-```
-tran tran stop=1u errpreset=moderate
-```
-- `stop`: simulation end time
-- `errpreset`: accuracy level — `liberal` (fast), `moderate` (balanced), `conservative` (accurate)
-- When to use: digital switching, IO ring transient, settling time
+All 7 core sections plus the IO pad SPICE model are required for IO Ring. Omitting the IO model
+causes undefined subcircuit errors for pad cells.
 
-### AC Analysis
-```
-ac ac start=1 stop=1000M dec=1000
-```
-- `start/stop`: frequency range (Hz)
-- `dec`: points per decade
-- Requires an AC stimulus: a voltage source with `mag=1` or `acm=1`
-- When to use: amplifier gain/phase, bandwidth, stability
-
-### Noise Analysis
-```
-noise (VOUT 0) vsrc=V3 start=1 stop=1000M dec=100
-```
-- Requires output node and input source specification
-- When to use: low-noise amplifier, input-referred noise
-
-## Choosing Analyses Based on Pin Types and Intent
-
-| Circuit Type | Primary Analysis | Secondary Analysis |
-|---|---|---|
-| Amplifier (analog_input → analog_output) | DC sweep + AC | Tran (settling) |
-| IO Ring (digital_bidirectional) | Tran | DC operating point |
-| Digital block | Tran | DC (transfer curve) |
-| ADC/DAC | Tran + FFT | DC |
-| PLL | Tran (lock time) | AC (loop gain) |
-| Voltage reference | DC sweep | Temperature sweep |
+---
 
 ## Save Signals
 
-- For specific signals: `save VOUT VIP VIN` (no slash prefix in save statements)
-- In sim_config.json, use slash prefix for signal paths (e.g. `"/VOUT"`) — the deck builder strips it
-- For all public signals: `saveOptions options save=allpub`
-- For everything including internal nodes: `saveOptions options save=all`
-- Use specific saves when you know which signals matter for output expressions
-- Use `allpub` as a safe default when you're not sure
-
-## Output Expressions
-
-These define named measurements computed from simulation results:
-
-```
-save Av_big = VOUT / (VIP - VIN)
+```spectre
+saveOptions options save=allpub
 ```
 
-- `eval_type=point`: scalar value (for DC analysis)
-- `eval_type=wave`: waveform (for TRAN/AC analysis)
-- Use top-level net names without slash prefix in expressions: `VOUT`, not `/VOUT`
+Always use `allpub` for IO Ring. This saves all top-level node voltages and branch currents,
+which are needed for power calculation. Do not use a selective save list — you cannot know in
+advance which internal nodes the power expressions will reference.
 
-## Info Statements
+---
 
-Standard set (always include these):
-```
-modelParameter info what=models where=rawfile
-element info what=inst where=rawfile
-outputParameter info what=output where=rawfile
-designParamVals info what=parameters where=rawfile
-primitives info what=primitives where=rawfile
-subckts info what=subckts where=rawfile
-```
+## Power Calculation (Required Output Expressions)
 
-## Simulator Options
+Power must be computed from transient using the `pwr()` function and `integ()`.
 
-Default values (override if user specifies):
-```
-reltol=1e-4
-vabstol=1e-6
-iabstol=1e-12
-gmin=1e-12
-temp=27.0
-tnom=27.0
-pivrel=1e-3
+### Per-Device Average Power
+
+For every stimulus/load instance placed in the TB (every `SRC_*`, `LOAD_*`, `INNER_*`, `PVSS` device):
+
+```spectre
+<device_name>_pwr = integ(pwr(<device_name>), 0, <tstop>) / <tstop>
 ```
 
-- For transient with digital signals: use `errpreset=moderate`
-- For precision analog (ADC, PLL): use `errpreset=conservative`
-- For quick DC sweep: `reltol=1e-3` is acceptable
+- `pwr(instance_name)` returns the instantaneous power drawn by that instance (watts).
+- `integ(..., 0, tstop) / tstop` gives average power over the simulation window.
+- Name the output `<instance_name>_pwr` (e.g. `SRC_VDD_pwr`, `INNER_D0_pwr`).
 
-## Safety Rules
+### DUT Supply Current (optional, for cross-check)
 
-1. **Always** include `global 0` — Spectre needs a ground reference
-2. **Always** include `pre_simu` and `ttmacro_mos_moscap` sections for TSMC28
-3. **Always** declare design variables that the netlist references (e.g. `VDD`)
-4. DC analysis should run **before** AC or TRAN (sets operating point)
-5. If a voltage source has `mag=1` or `acm=1`, AC analysis is expected
-6. If a voltage source is `vpulse`, TRAN analysis is expected
-7. The `user_intent` field takes priority over heuristic pin-type rules
+```spectre
+idd = integ(-i(SRC_VDD:PLUS), 0, <tstop>) / <tstop>
+```
 
-## Common Configurations
+Where `SRC_VDD` is the stimulus instance for the VDD pin. The minus sign accounts for
+Spectre's current direction convention (positive current flows into PLUS terminal).
 
-### 5T Amplifier (DC gain + AC frequency response)
+---
+
+## sim_config.json Schema (Produced by LLM)
+
 ```json
 {
-  "design_vars": [{"name": "VDD", "expression": "1.8"}],
   "analyses": [
-    {"name": "dc", "enabled": true, "sweep": {"param": "VDD", "start": "0", "stop": "3", "lin": "100"}},
-    {"name": "ac", "enabled": true, "sweep": {"param": "freq", "start": "1", "stop": "1000M", "dec": "1000"}}
+    {
+      "name": "dcOp",
+      "type": "dc",
+      "enabled": true
+    },
+    {
+      "name": "tran",
+      "type": "tran",
+      "enabled": true,
+      "stop": "<computed tstop, e.g. 500n>",
+      "maxstep": "<tstop/1000, e.g. 500p>",
+      "errpreset": "moderate"
+    }
   ],
-  "save_signals": [{"signal": "/VIP"}, {"signal": "/VIN"}, {"signal": "/VOUT"}],
-  "outputs": [{"name": "Av_big", "expression": "VOUT / (VIP - VIN)", "eval_type": "point"}]
+  "model_includes": [],
+  "save_default": "allpub",
+  "outputs": [
+    {
+      "name": "SRC_VDD_pwr",
+      "expression": "integ(pwr(SRC_VDD), 0, <tstop>) / <tstop>",
+      "eval_type": "wave",
+      "from_analysis": "tran"
+    }
+  ]
 }
 ```
 
-### IO Ring (Transient switching test)
-```json
-{
-  "design_vars": [{"name": "VDD", "expression": "1.8"}],
-  "analyses": [
-    {"name": "tran", "enabled": true, "stop": "100n", "errpreset": "moderate"}
-  ],
-  "save_signals": [],
-  "save_default": "allpub"
-}
+Rules for field values:
+- `model_includes`: leave empty `[]` — the deck builder injects paths from `.env` automatically.
+- `eval_type`: always `"wave"` for power expressions (they are time-domain waveforms from tran).
+- `from_analysis`: always `"tran"` for power expressions; `"dcOp"` for any DC operating-point readout.
+- `outputs`: list every `SRC_*`, `LOAD_*`, `INNER_*` device individually. Skip `GND_REF` and PVSS devices — they are reference sources, not power consumers.
+
+---
+
+## Determining `tstop`
+
+1. Collect all `per` values from `vpulse` stimulus params across all pins.
+2. `tstop = 10 × max(per)`. If no vpulse sources exist (pure analog cell), use `500n`.
+3. Clamp to `[100n, 10u]`.
+4. Round to a readable value: prefer multiples of 100n or 500n.
+
+Example: if `per` values are `7n`, `10n`, `14n` → `tstop = 10 × 14n = 140n` → round to `200n`.
+
+---
+
+## Simulator Options (Standard)
+
+Always emit these in the deck header:
+
+```spectre
+simulatorOptions options reltol=1e-4 vabstol=1e-6 iabstol=1e-12 gmin=1e-12 temp=27.0 tnom=27.0
 ```
+
+Do not change these unless the user explicitly asks. Do not add `pivrel` — it conflicts with some
+IO pad model formulations.
+
+---
+
+## What NOT to Include
+
+| Item | Reason |
+|------|--------|
+| `design_vars` / `parameters` block | No design variables in IO Ring TB |
+| `ac` analysis | Not applicable to IO Ring |
+| DC sweep (`param=VDD start=0 stop=3`) | No sweep — fixed operating point only |
+| `save VIN VOUT ...` specific signals | Use `allpub` instead |
+| Signal-level output expressions (e.g. gain, bandwidth) | Power only — no signal-processing metrics |
+| `info what=models ...` blocks | Optional, omit unless user asks for model audit |

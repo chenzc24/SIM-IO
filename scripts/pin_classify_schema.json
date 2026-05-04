@@ -115,7 +115,7 @@
           },
           "ground_net": {
             "type": ["string", "null"],
-            "description": "Local ground net name for this pin's block (e.g. 'gnd_DAT', 'dgnd'). Source/load MINUS terminals connect here, NOT gnd!. Null = use gnd! (top-level only)."
+            "description": "Ground domain for internal grouping (e.g. 'gnd_DAT', 'dgnd'). Used by the program to determine which primary ground pin name to use for source MINUS labels — NOT used as a schematic label. Null = top-level ground (--GND)."
           }
         }
       }

@@ -634,10 +634,15 @@ def sim_config_from_site(
 ) -> SimDeckConfig:
     """Build SimDeckConfig from site defaults.
 
-    Uses TSMC28 model file and 7 standard sections by default.
+    Uses SIM_PDK_CORE_SPECTRE_INCLUDE env var (or hardcoded TSMC28 fallback)
+    and SIM_PDK_CORE_SPECTRE_SECTIONS env var (or hardcoded TSMC28_SECTIONS).
     """
-    mf = model_file or TSMC28_MODEL_FILE
-    secs = sections or TSMC28_SECTIONS
+    mf = model_file or os.getenv("SIM_PDK_CORE_SPECTRE_INCLUDE", "") or TSMC28_MODEL_FILE
+    secs_str = os.getenv("SIM_PDK_CORE_SPECTRE_SECTIONS", "")
+    if secs_str:
+        secs = secs_str.split(",")
+    else:
+        secs = sections or TSMC28_SECTIONS
 
     # IO pad model — only include if the env var is set (PDK-specific)
     io_model_path = os.getenv("SIM_PDK_IO_SPECTRE_INCLUDE", "")
@@ -653,7 +658,7 @@ def sim_config_from_site(
             AnalysisSpec(name="dc", sweep=SweepSpec(
                 param="VDD", start="0", stop=str(vdd_value * 1.5), lin="50"
             )),
-            AnalysisSpec(name="tran", stop="10u", errpreset="moderate"),
+            AnalysisSpec(name="tran", stop="100n", errpreset="liberal"),
         ],
         save_signals=[],
         outputs=[],
@@ -698,10 +703,8 @@ def resolve_sim_config(
         print(f"[sim-config] Loaded LLM config from {llm_path}")
         return config
 
-    # 2. Maestro active.state
+    # 2. Maestro active.state (must be in run_dir — not scattered in parent dirs)
     state_path = run_dir / "active.state"
-    if not state_path.exists():
-        state_path = run_dir.parent / "active.state"
     if state_path.exists():
         try:
             config = parse_active_state(state_path)

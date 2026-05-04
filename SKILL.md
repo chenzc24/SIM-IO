@@ -12,175 +12,283 @@ description: >
 
 # SIM-IO — Simulation Testbench Builder
 
-## Overview
+Master orchestrator for building a complete simulation TB around a DUT cell in Cadence Virtuoso.
 
-This skill builds a complete simulation testbench (TB) around a DUT in Cadence Virtuoso.
-The pipeline runs through these stages:
+## Pipeline at a Glance
 
-1. **Symbol Export** — TSG pipeline generates a symbol from the schematic
-2. **Pin Redistribution** — symbol pins are redistributed evenly on 4 sides
-3. **TB Cellview Creation** — a `{cell}_tb` schematic is created
-4. **DUT Placement + Wiring** — DUT instance placed, pins labeled, sources/loads added
-5. **ADE Assembler** — deferred (requires ADE permission)
+```
+Source Schematic
+       │
+  [Phase A]  symbol export → pin redistribution → pin extraction
+       │
+  pin_info.json
+       │
+  [LLM stop] read pin_info.json + pin_classification.md
+             → write pin_classifications.json
+       │
+  [Phase B]  create TB schematic → place DUT → wire labels
+             → place sources/loads → Maestro setup
+       │
+  [Sim]      Spectre netlist → deck build → run → verify
+```
 
-## Key Concept: LLM-Driven Pin Classification
+Each phase is a single CLI call. The LLM classification step is a deliberate pause between them.
 
-Pin type classification (power, ground, digital_input, analog_output, clock, etc.)
-is **not hardcoded**. Instead:
+---
 
-1. The Python pipeline (`src/sim_flow.py`) extracts pin info (name, direction, position, side)
-   from the Virtuoso symbol and writes it to `pin_info.json`
-2. **You (the LLM)** read `pin_info.json` + the classification rules in
-   `references/pin_classification.md`, then classify each pin
-3. You write the classification result to `pin_classifications.json`
-4. The Python pipeline reads your classifications and places the correct stimulus/load
+## Entry Points
 
-This makes the system adaptable — you can add new pin types, handle naming conventions
-from different foundries, and apply domain knowledge that hardcoded regex cannot capture.
+| Situation | Start here |
+|-----------|-----------|
+| Fresh run: user provides `lib` + `cell` | Step 0 → Phase A |
+| Phase A already done (`.latest_run` exists, no classification yet) | LLM Classification |
+| `pin_classifications.json` already written | Phase B |
+| TB exists, run simulation only | `phase_b.py --run-sim --run-dir <path>` |
 
-## When to Classify Pins
+---
 
-When the sim_flow pipeline reaches Step 4b, it will output `pin_info.json` to the
-run directory. At that point:
+## Step 0: Environment Setup
 
-1. Read `references/pin_classification.md` for the classification rules and topology tables
-2. Read the `pin_info.json` file from the current run directory
-3. Classify every pin according to the rules — include BOTH outer and inner side devices
-4. Write the result following the schema in `scripts/pin_classify_schema.json`
-5. Save as `pin_classifications.json` in the same run directory
-6. The pipeline will pick it up and proceed with source/load placement
+Run once per session before any other step.
 
-## Dual-Side Topology
+```bash
+# Auto-detect skill root
+SKILL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/SIM-IO"
 
-The testbench has devices on **both sides** of the DUT symbol. You MUST specify
-what goes on each side for every pin.
+# Resolve Python (project .venv preferred)
+PROJECT_ROOT="$(cd "${SKILL_ROOT}" && while [ ! -d .venv ] && [ "$(pwd)" != "/" ]; do cd ..; done; pwd)"
+if   [ -f "${PROJECT_ROOT}/.venv/Scripts/python.exe" ]; then export AMS_PYTHON="${PROJECT_ROOT}/.venv/Scripts/python.exe"
+elif [ -f "${PROJECT_ROOT}/.venv/bin/python" ];         then export AMS_PYTHON="${PROJECT_ROOT}/.venv/bin/python"
+elif command -v python3 &>/dev/null;                    then export AMS_PYTHON="python3"
+else echo "ERROR: No Python found."; return 1; fi
+echo "AMS_PYTHON=${AMS_PYTHON}"
 
-**OUTER (left)** = IO pad side = the pin itself.
-**INNER (right)** = CORE side = `_CORE` suffix pins or duplicate pins.
+# Load site configuration (.env in SIM-IO root)
+[ -f "${SKILL_ROOT}/.env" ] && { set -a; . "${SKILL_ROOT}/.env"; set +a; }
+```
 
-The outer and inner devices are **complementary**:
+**All subsequent steps use `$AMS_PYTHON`.**
 
-| Outer device | Inner device | Domain |
-|-------------|-------------|--------|
-| vdc (voltage source) | idc (compliance current, ~few mA) | analog |
-| idc (current source) | vdc (compliance voltage, ~200-500mV) | analog |
-| cap (digital output load) | vpulse (digital output stimulus) | digital |
-| vpulse (digital input stimulus) | cap (digital input load) | digital |
-| — (ground = PVSS) | — | ground |
-| — (noConn) | digital_hv supply inner | digital_hv |
+Ask the user for `lib` and `cell` if not provided. Optional: `--vdd <volts>` (default 1.8).
 
-**Value selection**: Pick reasonable but NON-ROUND values within typical ranges.
-Good: `2.7m`, `0.37`, `1.72`, `0.87`. Bad: `3m`, `0.3`, `1.8`, `0.9`.
+---
 
-Full topology tables are in `references/pin_classification.md`.
+## Phase A: Symbol Export + Pin Redistribution + Extraction
 
-## Domains
+```bash
+$AMS_PYTHON ${SKILL_ROOT}/scripts/phase_a.py <lib> <cell> [--vdd <vdd_value>]
+```
 
-Every pin belongs to a domain that determines its ground reference:
+**What happens internally:**
+1. **TSG export** — generates `{lib}/{cell}/symbol` from schematic via `schSchemToPinList` + `schPinListToSymbol`
+2. **Redistribution** — extracts symbol geometry (`extract_symbol_info.il`), computes new layout (Python), applies it (`apply_layout.il`) — pins reorganized left/right
+3. **Pin extraction** — reads terminal names, directions, positions from redistributed symbol
 
-| Domain | Ground net | Ground device | Used by |
-|--------|-----------|---------------|---------|
-| `analog` | `gnd_{BLOCK}` | PVSS per block | VDD*, VREF*, VCM*, IB*, VIN* |
-| `digital` | `dgnd` | GIOL / PVSS1DGZ | D*, SDI, SDO, SYNC, GIO*, clock, reset |
-| `digital_hv` | `dgnd_hv` | PVSS2DGZ | PVDD2POC, PVSS2DGZ |
+**Outputs:**
+- `output/<timestamp>/pin_info.json` — input to LLM classification
+- `output/<timestamp>/phase_a_result.json` — checkpoint for Phase B
+- `.latest_run` — absolute path to the run directory
 
-## Output Schema
+**Exit codes:**
+- `0` → proceed to LLM Classification
+- `1` → error printed to stderr (common causes: Virtuoso not connected, lib/cell not found, no schematic view)
 
-See `scripts/pin_classify_schema.json` for the exact JSON structure.
-Each pin entry must include:
+---
 
+## LLM Stop (Between Phases — YOU do this)
+
+Phase A stops here. You must produce **two files** before Phase B can run:
+`pin_classifications.json` and `sim_config.json`. Both go in the same run directory.
+
+Find the run directory: read `SIM-IO/.latest_run` or use the path printed by Phase A.
+
+---
+
+### File 1 — Pin Classifications
+
+1. Read `references/pin_classification.md` — classification rules, topology tables, domain definitions
+2. Read `<run_dir>/pin_info.json` — pin names, directions, positions, side (left/right)
+3. Classify every pin according to the rules
+4. Write `<run_dir>/pin_classifications.json` following schema in `scripts/pin_classify_schema.json`
+
+Key principles (full rules in `references/pin_classification.md`):
+- `pin_type` from pin name prefix + direction
+- `domain` (analog / digital / digital_hv) — sets the ground reference
+- `stimulus` + `stimulus_params` for the outer (left/pad) side
+- `inner_stimulus` + `inner_params` for the inner (right/CORE) side
+- Non-round values only (e.g. `2.7m` not `3m`, `1.72` not `1.8`)
+
+---
+
+### File 2 — Simulation Config
+
+1. Read `references/sim_config_rules.md` — IO Ring simulation rules
+2. From `pin_classifications.json`, collect all `vpulse` stimulus params to compute `tstop`:
+   - Gather every `per` value across all pin stimulus/inner_stimulus params
+   - `tstop = 10 × max(per)`, clamped to `[100n, 10u]`
+   - If no vpulse sources: use `500n`
+3. List every placed device that is NOT `pin_type=ground` and NOT `pin_type=no_connect`:
+   these are `SRC_<pin>`, `LOAD_<pin>`, `INNER_<pin>` instances
+4. Write `<run_dir>/sim_config.json`
+
+`sim_config.json` is consumed by Phase B in two places:
+- **Maestro setup** (Step 4e) — configures analyses and outputs in Virtuoso Maestro
+- **Spectre deck** (Step 5) — controls netlist analyses, save statements, and power expressions
+
+Schema (see `scripts/sim_config_schema.json` for full spec):
 ```json
 {
-  "name": "D0",
-  "pin_type": "digital_output",
-  "domain": "digital",
-  "confidence": 0.90,
-  "reason": "D prefix = data, output direction, digital domain",
-  "stimulus": null,
-  "stimulus_params": null,
-  "load": "cap",
-  "load_params": {"c": "10p"},
-  "inner_stimulus": "vpulse",
-  "inner_params": {"v1": "0", "v2": "1.72", "per": "7n", "tr": "0.1n", "tf": "0.1n", "pw": "3.5n"},
-  "ground_net": "dgnd"
+  "analyses": [
+    {"name": "dcOp", "type": "dc", "enabled": true},
+    {"name": "tran", "type": "tran", "enabled": true,
+     "stop": "<tstop>", "maxstep": "<tstop/1000>", "errpreset": "moderate"}
+  ],
+  "model_includes": [],
+  "save_default": "allpub",
+  "outputs": [
+    {
+      "name": "SRC_VDD_pwr",
+      "expression": "integ(pwr(SRC_VDD), 0, <tstop>) / <tstop>",
+      "eval_type": "wave",
+      "from_analysis": "tran"
+    }
+  ]
 }
 ```
 
-Required fields: `name`, `pin_type`, `domain`, `confidence`, `reason`
-Dual-side fields: `stimulus`/`stimulus_params` (outer), `inner_stimulus`/`inner_params` (inner)
+One `outputs` entry per non-ground, non-noConn device. `model_includes` is always `[]` — Phase B injects PDK paths from `.env` automatically.
 
-Valid `pin_type`: `power`, `ground`, `digital_input`, `digital_output`, `digital_bidirectional`,
-`analog_input`, `analog_output`, `analog_bidirectional`, `clock`, `reset`, `reference`,
-`bias_current`, `no_connect`
+---
 
-Valid `domain`: `analog`, `digital`, `digital_hv`
+## Phase B: TB Build + Source/Load Placement + Maestro
 
-## Naming Convention System
+```bash
+$AMS_PYTHON ${SKILL_ROOT}/scripts/phase_b.py [--run-dir <path>]
+```
 
-Pin names encode their function via **prefix patterns**. The full convention is
-documented in `references/pin_classification.md`, which you MUST read before
-classifying pins. Key points:
+`--run-dir` is optional; defaults to path in `.latest_run`.
 
-- **`VDD*`** → `power` / `analog` (typically 0.9V core), **`VIOL`** → 0.9V, **`VIOH`** → 1.8V
-- **`IB*`/`IBUF*`** → `bias_current` / `analog` (idc, NOT vdc — these are current sources)
-- **`VREF*`/`VCM*`** → `reference` / `analog` (need specific DC voltage, NOT "no stimulus")
-- **`VINP`/`VINN`** → `analog_input` / `analog` (biased at VCM, typically 0.45V)
-- **`D*`/`SDI`/`SDO`/`SYNC`/`GIO*`** → digital types / `digital` domain
-- **`PVDD2POC`** → `power` / `digital_hv`, inner = noConn
-- **`PVSS2DGZ`** → `ground` / `digital_hv`, inner = noConn
-- **`*_CORE`** → same type as the base pin, but gets inner-side devices
+**What happens internally:**
+1. **Create TB cellview** — creates `{lib}/{cell}_tb/schematic` (fresh, overwrites if exists)
+2. **Place DUT** — instantiates `{lib}/{cell}/symbol` as `DUT` at (2.5, 0.0)
+3. **Wire labels** — places net name labels on each DUT terminal (label-based wiring — no explicit wires)
+4. **Sources + loads** — places stimulus/load devices based on your `pin_classifications.json`:
+   - Outer (left): sources/loads for pad-side signals
+   - Inner (right): complementary devices for CORE-side signals
+   - PVSS devices (one per ground pin) + GND_REF bridge to `gnd!`
+   - CDF parameters set via `set_inst_params.il`
+5. **Maestro setup** — configures Maestro test for GUI simulation
 
-Different users may use slightly different suffixes, but the prefix pattern is stable.
+**Outputs:**
+- `{lib}/{cell}_tb/schematic` in Virtuoso
+- `output/<timestamp>/result.json` — full run summary
 
-## Testbench Topology: PVSS and Ground Sharing
+**Exit codes:**
+- `0` → TB complete, proceed to simulation or stop
+- `1` → error printed to stderr
 
-Ground pins are NOT wired to the global `gnd!` net. Instead, each functional block
-gets a **PVSS device** — a `vdc` at ~0V that provides a named local ground.
+---
 
-Full topology rules are in `references/pin_classification.md` (Testbench Topology Rules).
-Key principles:
+## Step 5: Run Simulation
 
-1. **PVSS ≠ gnd!**: PVSS is a `vdc(vdc=0)` instance. PLUS = local ground net,
-   MINUS = `gnd!`. This allows ground current measurement and domain isolation.
-2. **Block-based sharing**: Pins with the same block suffix (e.g., `GND_DAT` + `GND_DAT_CORE`
-   + `VDD_DAT` = `DAT` block) share one PVSS (`PVSS_DAT`) and one local ground net (`gnd_DAT`).
-3. **Digital ground is separate**: Digital-domain pins use `dgnd` (provided by GIOL/PVSS1DGZ),
-   not analog block grounds.
-4. **Source reference terminals**: The MINUS terminal of every source/load in a block
-   connects to the block's local ground net, NOT `gnd!`.
-5. **Inner devices also use local ground**: Inner-side (CORE) device reference terminals
-   connect to the same ground net as the outer-side devices for that block.
+```bash
+$AMS_PYTHON ${SKILL_ROOT}/scripts/phase_b.py --run-sim [--intent "<description>"]
+```
 
-## Label-Based Wiring
+Or if the TB is already built, pass `--run-dir` to an existing run directory.
 
-No explicit wires are drawn. Instead, the same net name label is placed on both
-the DUT terminal and the source/load terminal. Virtuoso auto-connects terminals
-that share a net label.
+**Internal flow:**
+1. `run_maestro_sim()` — opens background Maestro session, runs Spectre inside Maestro, polls until done
+2. `read_results()` — reads scalar OCEAN outputs per point: `vmax_<pin>`, `vmin_<pin>`, `I_<pin>`, `P_<pin>`
+3. `parse_maestro_measurements()` — maps outputs → `measurements.json` (Python-accessible per-pin dict)
+4. `plot_maestro_waves()` — parses `maestro_waves/*.txt` → `plots/tran_maestro.svg`
+5. `verify_results()` — compares measurements against golden specs → `verify.json`
 
-- DUT pin `DIN0` gets label `DIN0`
-- Source `SRC_DIN0` terminal `PLUS` gets label `DIN0`  →  auto-connected
-- Source `SRC_DIN0` terminal `MINUS` gets label for the block's local ground net
+**Outputs written to `output/<timestamp>/`:**
 
-Ground-type pins are labeled with their block's local ground net (e.g., `gnd_DAT`),
-NOT `gnd!`. The PVSS device bridges the local ground to `gnd!`.
+| File | Content |
+|------|---------|
+| `maestro_result.json` | Raw Maestro per-point output table |
+| `measurements.json` | Per-pin `vmax`/`vmin`/`iavg`/`pavg` — Python-readable |
+| `verify.json` | PASS/FAIL verdict per pin |
+| `maestro_waves/*.txt` | Raw OCEAN two-column waveform text (time, voltage) |
+| `plots/tran_maestro.svg` | SVG transient waveform visualization |
 
-## Fallback Behavior
+The Maestro cellview is always configured in Step 4e (even without `--run-sim`), so you can also open the test manually in the Virtuoso GUI and run it there.
 
-If no LLM classification file exists, the pipeline falls back to
-`src/pin_types.py:classify_pin_heuristic()` — the original name-matching heuristic.
-This ensures the pipeline always works, even without LLM involvement.
+---
+
+## Troubleshooting
+
+| Problem | Solution |
+|---------|---------|
+| Phase A exit 1 "not found in Virtuoso" | Check `lib`/`cell` spelling; verify Virtuoso is connected and cds.lib is loaded |
+| Phase A exit 1 "no schematic view" | Cell exists but has no schematic — open schematic in Virtuoso first |
+| Virtuoso not responding | Check `SIM_VB_LOCAL_PORT` in `.env`; verify `virtuoso-bridge start` is running |
+| Symbol redistribution wrong layout | Inspect `output/<ts>/extract_raw.txt` and `layout_result.json`; check `LayoutConfig` in `sim_io/symbol/layout_engine.py` |
+| Phase B: "pin_classifications.json not found" | WARNING only — runs with heuristic fallback. Write the file for accurate placement |
+| Phase B: wrong device placed | Re-check `pin_classifications.json`; verify `pin_type`, `domain`, `stimulus`, `inner_stimulus` fields |
+| Spectre: license error | Set `SIM_LM_LICENSE_FILE` and `SIM_CDS_LIC_FILE` in `.env` |
+| Spectre: no convergence | Check stimulus values — ensure `vdc`/`vpulse` params are within PDK operating range |
+| Maestro eval error | Known issue — Maestro dialog may require manual confirmation; see memory `feedback_sim_io_pipeline.md` |
+| `si` netlist export hangs | Confirmation dialog opened in Virtuoso GUI — dismiss it manually or set `si_batch=yes` in site config |
+
+---
 
 ## File Guide
 
 | Path | Purpose |
 |------|---------|
-| `src/sim_flow.py` | Main pipeline (Steps 1–4) |
-| `src/pin_types.py` | Pin data structures, PAD_RULES, heuristic fallback, LLM loader |
-| `src/symbol_layout_engine.py` | Layout calculation engine for pin redistribution |
-| `src/sim_viz.py` | PSF parser + SVG plot generator (DC sweep, AC Bode, TRAN waveform) |
-| `src/symbol_redistribute.py` | Standalone redistribution runner |
-| `src/bridge/` | Bridge call patterns for Virtuoso operations |
-| `skill_code/` | SKILL (.il) files executed on the Virtuoso side |
-| `references/pin_classification.md` | Classification rules + dual-side topology tables (LLM reads this) |
-| `scripts/pin_classify_schema.json` | JSON schema for classification output |
-| `docs/` | Design docs and progress notes |
+| `scripts/phase_a.py` | CLI: Phase A entry point |
+| `scripts/phase_b.py` | CLI: Phase B entry point (TB build + optional sim) |
+| `sim_io/flow.py` | Core pipeline — `run_phase_a()`, `run_phase_b()`, `run_sim_flow()` |
+| `sim_io/pin_types.py` | `PinInfo`, `PinClassification`, heuristic fallback, JSON loader |
+| `sim_io/symbol/layout_engine.py` | Pure-Python layout calculator for pin redistribution |
+| `sim_io/bridge/edit_patterns.py` | Virtuoso schematic editing API (`batch_ops`, `label_term`, `create_inst`) |
+| `sim_io/sim/viz.py` | `TranData`, `plot_tran()` — SVG waveform generator (reused by Maestro route) |
+| `sim_io/maestro/setup.py` | Maestro testbench setup generator |
+| `sim_io/maestro/results.py` | `parse_maestro_measurements()` — Maestro outputs → `measurements.json` |
+| `sim_io/maestro/waves.py` | `plot_maestro_waves()` — `maestro_waves/*.txt` → SVG |
+| `skill_code/extract_symbol_info.il` | SKILL: extract symbol geometry (called in Phase A Step 2) |
+| `skill_code/set_inst_params.il` | SKILL: set CDF parameters on instances (called in Phase B Step 4) |
+| `references/pin_classification.md` | **Classification rules + dual-side topology tables — read before classifying** |
+| `scripts/pin_classify_schema.json` | JSON schema for `pin_classifications.json` |
+| `scripts/sim_config_schema.json` | JSON schema for simulation deck configuration |
+| `.env` | Site-specific paths: cds.lib, IC_ROOT, MMSIM_ROOT, license, PDK model paths |
+| `.latest_run` | Absolute path to current run directory (written by Phase A) |
+
+---
+
+## Run Directory Structure
+
+```
+output/<YYYYMMDD_HHMMSS>/
+├── pin_info.json              Phase A output → LLM input
+├── pin_classifications.json   LLM output → Phase B (source/load placement)
+├── sim_config.json            LLM output → Phase B (Maestro setup + Spectre deck)
+├── phase_a_result.json        Phase A checkpoint (loaded by scripts/phase_b.py)
+├── result.json                Phase B final summary
+├── extract_raw.txt            Raw output from extract_symbol_info.il
+├── layout_result.json         Computed pin layout (body + pin positions)
+├── apply_layout.il            Generated SKILL for redistribution
+├── verify.json                Simulation verdict + measurements
+├── deck.raw                   PSF data from Spectre
+├── skill_code/                Logged copies of all .il files used
+└── plots/                     SVG waveforms (DC/AC/TRAN)
+```
+
+---
+
+## Checklist
+
+- [ ] Step 0: `AMS_PYTHON` resolved; `.env` loaded
+- [ ] Phase A exit 0: `pin_info.json` written, `.latest_run` updated
+- [ ] LLM: read `references/pin_classification.md` before classifying
+- [ ] LLM: every pin classified — including `_CORE` suffix pins
+- [ ] LLM: `pin_classifications.json` written to `<run_dir>/`, not to SIM-IO root
+- [ ] LLM: read `references/sim_config_rules.md` before writing sim config
+- [ ] LLM: `tstop` computed from max vpulse `per` × 10
+- [ ] LLM: `sim_config.json` written to `<run_dir>/` with one power output per non-ground device
+- [ ] Phase B exit 0: `{cell}_tb/schematic` created in Virtuoso
+- [ ] Phase B: `result.json` written to run directory
+- [ ] Sim (if requested): `measurements.json`, `verify.json`, and `plots/tran_maestro.svg` present in run directory
