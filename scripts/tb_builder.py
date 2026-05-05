@@ -115,17 +115,6 @@ def run_tb_builder(
             print(f"[tb_builder] Cleanup also failed: {cleanup_exc}")
         raise
 
-    # Save checkpoint so maestro_runner can run independently
-    checkpoint = {
-        "lib": lib,
-        "tb_cell": tb_cell,
-        "labels": labels,
-        "sources": sources,
-    }
-    (phase_a.run_dir / "tb_builder_result.json").write_text(
-        json.dumps(checkpoint, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-
     print(f"\n{'='*60}")
     print(f" TB Builder Complete")
     print(f"  TB cellview:       {lib}/{tb_cell}/schematic")

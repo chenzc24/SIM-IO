@@ -44,13 +44,6 @@ class MaestroSimResult:
     waveform_paths: list[str] = field(default_factory=list)
     run_dir: Optional[str] = None
 
-    def save(self, run_dir: Path) -> None:
-        data = asdict(self)
-        data["run_dir"] = str(run_dir)
-        (run_dir / "maestro_result.json").write_text(
-            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-
 
 # ── Simulation Runner ─────────────────────────────────────────
 
@@ -105,7 +98,7 @@ def run_maestro_sim(
             print(f"[maestro-sim] Pre-creating netlist to avoid dialog...")
             netlist_dir = f"/tmp/vb_maestro_netlist_{tname}"
             create_netlist_for_corner(
-                client, tname, "tt", netlist_dir, session=session
+                client, tname, "tt", netlist_dir
             )
             print(f"[maestro-sim] Netlist created: {netlist_dir}")
         except Exception as e:
@@ -193,10 +186,6 @@ def run_maestro_sim(
             print(f"[maestro-sim] Session closed")
         except Exception as e:
             print(f"[maestro-sim] WARNING: close_session failed: {e}")
-
-    # Save result metadata
-    if run_dir:
-        result.save(run_dir)
 
     _print_sim_summary(result)
     return result

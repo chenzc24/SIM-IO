@@ -1,8 +1,8 @@
 """Parse MaestroSimResult outputs into Python-accessible measurements dict.
 
-Converts the Maestro per-point output table (from read_results()) into the
-same format that sim_io.sim.run.parse_results() produces for Spectre, so
-verify_results() in sim_io.sim.verify can be called unchanged.
+Converts the Maestro per-point output table (from read_results()) into a
+per-pin measurements dict.  For pass/fail verification, read maestro_detail.csv
+which contains Maestro's own spec evaluation results.
 
 Output name → pin metric mapping (set up by _auto_generate_outputs in setup.py):
   vmax_<pin>  →  pins[pin]["vmax"]   (ymax of transient voltage)

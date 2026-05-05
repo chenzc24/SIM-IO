@@ -4,7 +4,7 @@
 Steps 4e–5:
   4e. Maestro test setup (configures cellview for GUI use too)
    5. Maestro simulation (if --run-sim)
-      → measurements.json, verify.json, plots/
+      → measurements.json, maestro_detail.csv, plots/
 
 Reads pin_classifications.json written by the LLM after symbol_export.
 Falls back to heuristic classification if the file is absent (warning only).
@@ -101,7 +101,6 @@ def run_maestro_runner(
 
     if run_sim and pins:
         from sim_io.maestro import run_maestro_sim, parse_maestro_measurements, plot_maestro_waves
-        from sim_io.sim.verify import verify_results
 
         wave_signals = [
             f"/{p.name}" for p in pins
@@ -135,24 +134,16 @@ def run_maestro_runner(
                 run_dir / "plots",
             )
 
-            report = verify_results(measurements, vdd=vdd_value, cell=tb_cell)
-            report.save(run_dir / "verify.json")
-            sim_verdict = report.verdict
-            print(f"[step5] verify.json: {sim_verdict} "
-                  f"(pass={report.num_pass}, fail={report.num_fail})")
-
     print(f"\n{'='*60}")
     print(f" Maestro Runner Complete")
     print(f"  Output dir:        {run_dir}")
     if sim_run_ok is not None:
         print(f"  Sim run:           {'OK' if sim_run_ok else 'FAILED'} (maestro)")
-    if sim_verdict is not None:
-        print(f"  Verify verdict:    {sim_verdict}")
     if plot_paths:
         print(f"  SVG plots:         {len(plot_paths)} file(s) in {run_dir / 'plots'}")
     print(f"{'='*60}\n")
 
-    return sim_run_ok, sim_verdict, plot_paths
+    return sim_run_ok, None, plot_paths
 
 
 # Backward compat alias

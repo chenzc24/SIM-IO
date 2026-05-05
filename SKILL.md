@@ -29,7 +29,7 @@ Source Schematic
   [Phase B]  create TB schematic → place DUT → wire labels
              → place sources/loads → Maestro setup
        │
-  [Sim]      Spectre netlist → deck build → run → verify
+  [Sim]      Spectre netlist → deck build → run → check CSV
 ```
 
 Each phase is a single CLI call. The LLM classification step is a deliberate pause between them.
@@ -203,17 +203,11 @@ Or if the TB is already built, pass `--run-dir` to an existing run directory.
 2. `read_results()` — reads scalar OCEAN outputs per point: `vmax_<pin>`, `vmin_<pin>`, `I_<pin>`, `P_<pin>`
 3. `parse_maestro_measurements()` — maps outputs → `measurements.json` (Python-accessible per-pin dict)
 4. `plot_maestro_waves()` — parses `maestro_waves/*.txt` → `plots/tran_maestro.svg`
-5. `verify_results()` — compares measurements against golden specs → `verify.json`
 
-**Outputs written to `output/<timestamp>/`:**
-
-| File | Content |
-|------|---------|
-| `maestro_result.json` | Raw Maestro per-point output table |
-| `measurements.json` | Per-pin `vmax`/`vmin`/`iavg`/`pavg` — Python-readable |
-| `verify.json` | PASS/FAIL verdict per pin |
-| `maestro_waves/*.txt` | Raw OCEAN two-column waveform text (time, voltage) |
-| `plots/tran_maestro.svg` | SVG transient waveform visualization |
+**After simulation, read `maestro_detail.csv` to check results.** It is the native Maestro output with per-output values, specs, and pass/fail. Look for:
+- **Errors**: rows where Nominal is empty and the output name is a pin (not vmax/vmin/I_/P_) — typically eval errors or netlist errors
+- **Failures**: rows with `fail` in the Pass/Fail column
+- **Missing outputs**: pins listed in `pin_info.json` but absent from the CSV
 
 The Maestro cellview is always configured in Step 4e (even without `--run-sim`), so you can also open the test manually in the Virtuoso GUI and run it there.
 
@@ -273,7 +267,7 @@ output/<YYYYMMDD_HHMMSS>/
 ├── extract_raw.txt            Raw output from extract_symbol_info.il
 ├── layout_result.json         Computed pin layout (body + pin positions)
 ├── apply_layout.il            Generated SKILL for redistribution
-├── verify.json                Simulation verdict + measurements
+├── maestro_detail.csv         Maestro native output (values, specs, pass/fail)
 ├── deck.raw                   PSF data from Spectre
 ├── skill_code/                Logged copies of all .il files used
 └── plots/                     SVG waveforms (DC/AC/TRAN)
@@ -293,4 +287,4 @@ output/<YYYYMMDD_HHMMSS>/
 - [ ] LLM: `sim_config.json` written to `<run_dir>/` with `pin_measurements` for every DUT pin
 - [ ] Phase B exit 0: `{cell}_tb/schematic` created in Virtuoso
 - [ ] Phase B: `result.json` written to run directory
-- [ ] Sim (if requested): `measurements.json`, `verify.json`, and `plots/tran_maestro.svg` present in run directory
+- [ ] Sim (if requested): `measurements.json`, `maestro_detail.csv`, and `plots/tran_maestro.svg` present in run directory
