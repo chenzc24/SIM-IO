@@ -19,18 +19,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-_PKG_DIR = Path(__file__).resolve().parent
-_SIM_IO = _PKG_DIR.parent.parent
-_BRIDGE_LITE = _SIM_IO.parent / "virtuoso-bridge-lite" / "src"
-for p in (_BRIDGE_LITE,):
-    if str(p) not in sys.path:
-        sys.path.insert(0, str(p))
-
 from virtuoso_bridge import VirtuosoClient
 from virtuoso_bridge.models import ExecutionStatus, SimulationResult
 from virtuoso_bridge.spectre.runner import SpectreSimulator, spectre_mode_args
 
-from sim_io.sim.deck import SimConfig, build_sim_deck_from_file
+from sim_io.sim.deck import build_sim_deck_from_file
 from sim_io.sim.config import (
     SimDeckConfig, summarize_netlist, write_sim_config_input,
     resolve_sim_config, SPECTRE_BIN, SPECTRE_LICENSE,
@@ -408,7 +401,7 @@ def build_deck(
 ) -> Path:
     """Build a complete Spectre deck from si netlist + config.
 
-    Accepts SimConfig (legacy) or SimDeckConfig (new).
+    Accepts SimDeckConfig.
     Returns the path to the complete deck file.
     """
     deck_text = build_sim_deck_from_file(netlist_path, config)
@@ -797,8 +790,8 @@ def run_sim_run(
     lib, tb_cell : Library and testbench cell names
     pins : Pin info list from Step 4b (for result mapping)
     run_dir : Output directory (typically from sim_flow)
-    config : SimConfig (legacy, used if deck_config is None)
-    deck_config : SimDeckConfig (new, takes priority over config)
+    config : SimDeckConfig or None (legacy, used if deck_config is None)
+    deck_config : SimDeckConfig (takes priority over config)
     site : SiteConfig (default: loaded from SIM-IO/.env)
     client : VirtuosoClient (default: from env)
     spectre_mode : Spectre execution mode
@@ -811,12 +804,9 @@ def run_sim_run(
     if site is None:
         site = SiteConfig.from_env()
     if config is None:
-        # Don't create a legacy SimConfig here — let resolve_sim_config()
-        # fall through to sim_config_from_site() which includes both
-        # core models (with sections) and IO models.
-        config = SimConfig(
-            model_include=site.pdk_spectre_include,
-        ) if site.pdk_spectre_include else None
+        # Let resolve_sim_config() fall through to sim_config_from_site()
+        # which includes both core models (with sections) and IO models.
+        config = None
 
     print(f"\n{'='*60}")
     print(f" Sim Run: {lib}/{tb_cell}")
@@ -860,24 +850,18 @@ def run_sim_run(
         )
 
     if resolved_config is None:
-        resolved_config = config  # fallback to legacy SimConfig
+        resolved_config = config
 
     # Append IO pad model include if available in site config
     if site.pdk_io_spectre_include and resolved_config is not None:
         from sim_io.sim.config import ModelInclude
-        if isinstance(resolved_config, SimDeckConfig):
-            # Check if IO model is already included
-            io_paths = {mi.path for mi in resolved_config.model_includes}
-            if site.pdk_io_spectre_include not in io_paths:
-                resolved_config.model_includes.append(
-                    ModelInclude(path=site.pdk_io_spectre_include, section="")
-                )
-                print(f"[step3b] Added IO model include: {site.pdk_io_spectre_include}")
-        elif isinstance(resolved_config, SimConfig):
-            # Legacy SimConfig: store in model_include if empty
-            if not resolved_config.model_include:
-                resolved_config.model_include = site.pdk_io_spectre_include
-                print(f"[step3b] Added IO model include (legacy): {site.pdk_io_spectre_include}")
+        # Check if IO model is already included
+        io_paths = {mi.path for mi in resolved_config.model_includes}
+        if site.pdk_io_spectre_include not in io_paths:
+            resolved_config.model_includes.append(
+                ModelInclude(path=site.pdk_io_spectre_include, section="")
+            )
+            print(f"[step3b] Added IO model include: {site.pdk_io_spectre_include}")
 
     # Add current save signals for power pins so standalone Spectre deck
     # includes branch currents (needed for power measurements).
@@ -1006,5 +990,11 @@ if __name__ == "__main__":
     _run_dir.mkdir(parents=True, exist_ok=True)
 
     _site = SiteConfig.from_env()
-    _cfg = SimConfig(model_include=_model or _site.pdk_spectre_include)
-    run_sim_run(_lib, _tb_cell, [], _run_dir, config=_cfg, site=_site)
+    from sim_io.sim.config import sim_config_from_site
+    _cfg = sim_config_from_site(vdd_value=1.8)
+    if _model or _site.pdk_spectre_include:
+        from sim_io.sim.config import ModelInclude
+        _cfg.model_includes.insert(0, ModelInclude(
+            path=_model or _site.pdk_spectre_include, section="TT"
+        ))
+    run_sim_run(_lib, _tb_cell, [], _run_dir, deck_config=_cfg, site=_site)

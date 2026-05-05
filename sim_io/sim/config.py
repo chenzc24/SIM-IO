@@ -238,7 +238,10 @@ def write_sim_config_input(
 
 def load_sim_config(path: str | Path) -> SimDeckConfig:
     """Load LLM-generated sim_config.json into SimDeckConfig."""
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, FileNotFoundError) as e:
+        raise ValueError(f"Failed to load sim_config from {path}: {e}") from e
     return _dict_to_deck_config(data, source="llm")
 
 

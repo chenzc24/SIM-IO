@@ -8,9 +8,12 @@ No SKILL calls, no network — all pure computation.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from math import isfinite
+
+logger = logging.getLogger(__name__)
 
 
 # ── Enums ──────────────────────────────────────────────────────
@@ -85,14 +88,14 @@ class SymbolInfo:
 
 @dataclass
 class LayoutConfig:
-    pin_pitch: float = 0.25
+    pin_pitch: float = 0.4
     wire_length: float = 0.375
     end_margin: float = 0.5
     label_inset: float = 0.125
     core_label_inset: float = 0.3
     center_x: float = 2.5
     center_y: float = -0.5
-    body_width: float = 7.5
+    body_width: float = 5.0
     min_body_half: float = 0.125
 
 
@@ -183,7 +186,8 @@ def parse_symbol_info(raw_output: str) -> SymbolInfo:
                     cx=float(parts[5]), cy=float(parts[6]),
                     fig_layer=fig_layer, fig_purpose=fig_purpose,
                 ))
-        except (ValueError, IndexError):
+        except (ValueError, IndexError) as e:
+            logger.warning("[layout_engine] Skipping malformed terminal line: %s (%s)", line.strip(), e)
             continue
     return info
 

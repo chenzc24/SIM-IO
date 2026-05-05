@@ -266,7 +266,10 @@ def classify_pin_heuristic(pin: PinInfo) -> str:
 
 def load_pin_classifications(path: str | Path) -> ClassificationResult:
     """Load LLM-generated pin classification JSON (v1 and v2 schema)."""
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, FileNotFoundError) as e:
+        raise ValueError(f"Failed to load pin classifications from {path}: {e}") from e
     pins = [
         PinClassification(
             name=p["name"],

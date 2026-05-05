@@ -28,8 +28,6 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "src"))
-
 from virtuoso_bridge import VirtuosoClient
 from virtuoso_bridge.virtuoso.schematic.ops import (
     schematic_create_inst_by_master_name as inst,

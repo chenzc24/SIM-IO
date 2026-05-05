@@ -43,7 +43,7 @@ Each phase is a single CLI call. The LLM classification step is a deliberate pau
 | Fresh run: user provides `lib` + `cell` | Step 0 → Phase A |
 | Phase A already done (`.latest_run` exists, no classification yet) | LLM Classification |
 | `pin_classifications.json` already written | Phase B |
-| TB exists, run simulation only | `phase_b.py --run-sim --run-dir <path>` |
+| TB exists, run simulation only | `maestro_runner.py --run-sim --run-dir <path>` |
 
 ---
 
@@ -76,7 +76,7 @@ Ask the user for `lib` and `cell` if not provided. Optional: `--vdd <volts>` (de
 ## Phase A: Symbol Export + Pin Redistribution + Extraction
 
 ```bash
-$AMS_PYTHON ${SKILL_ROOT}/scripts/phase_a.py <lib> <cell> [--vdd <vdd_value>]
+$AMS_PYTHON ${SKILL_ROOT}/scripts/symbol_export.py <lib> <cell> [--vdd <vdd_value>]
 ```
 
 **What happens internally:**
@@ -164,7 +164,7 @@ One `pin_measurements` entry per DUT pin. `model_includes` is always `[]` — Ph
 ## Phase B: TB Build + Source/Load Placement + Maestro
 
 ```bash
-$AMS_PYTHON ${SKILL_ROOT}/scripts/phase_b.py [--run-dir <path>]
+$AMS_PYTHON ${SKILL_ROOT}/scripts/tb_builder.py [--run-dir <path>]
 ```
 
 `--run-dir` is optional; defaults to path in `.latest_run`.
@@ -193,7 +193,7 @@ $AMS_PYTHON ${SKILL_ROOT}/scripts/phase_b.py [--run-dir <path>]
 ## Step 5: Run Simulation
 
 ```bash
-$AMS_PYTHON ${SKILL_ROOT}/scripts/phase_b.py --run-sim [--intent "<description>"]
+$AMS_PYTHON ${SKILL_ROOT}/scripts/maestro_runner.py --run-sim [--intent "<description>"]
 ```
 
 Or if the TB is already built, pass `--run-dir` to an existing run directory.
@@ -240,9 +240,10 @@ The Maestro cellview is always configured in Step 4e (even without `--run-sim`),
 
 | Path | Purpose |
 |------|---------|
-| `scripts/phase_a.py` | CLI: Phase A entry point |
-| `scripts/phase_b.py` | CLI: Phase B entry point (TB build + optional sim) |
-| `sim_io/flow.py` | Core pipeline — `run_phase_a()`, `run_phase_b()`, `run_sim_flow()` |
+| `scripts/symbol_export.py` | CLI: Symbol export + pin extraction entry point |
+| `scripts/tb_builder.py` | CLI: TB build entry point |
+| `scripts/maestro_runner.py` | CLI: Maestro setup + simulation entry point |
+| `sim_io/flow.py` | Core pipeline — `run_symbol_export()`, `run_tb_builder()`, `run_maestro_runner()`, `run_sim_flow()` |
 | `sim_io/pin_types.py` | `PinInfo`, `PinClassification`, heuristic fallback, JSON loader |
 | `sim_io/symbol/layout_engine.py` | Pure-Python layout calculator for pin redistribution |
 | `sim_io/bridge/edit_patterns.py` | Virtuoso schematic editing API (`batch_ops`, `label_term`, `create_inst`) |
@@ -267,7 +268,7 @@ output/<YYYYMMDD_HHMMSS>/
 ├── pin_info.json              Phase A output → LLM input
 ├── pin_classifications.json   LLM output → Phase B (source/load placement)
 ├── sim_config.json            LLM output → Phase B (Maestro setup + Spectre deck)
-├── phase_a_result.json        Phase A checkpoint (loaded by scripts/phase_b.py)
+├── phase_a_result.json        Symbol export checkpoint (loaded by tb_builder.py / maestro_runner.py)
 ├── result.json                Phase B final summary
 ├── extract_raw.txt            Raw output from extract_symbol_info.il
 ├── layout_result.json         Computed pin layout (body + pin positions)

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Phase A: symbol export → pin redistribution → pin extraction.
+"""Symbol Export: symbol generation → pin redistribution → pin extraction.
 
 Stops after writing pin_info.json so the LLM can classify pins.
-Run Phase B (scripts/phase_b.py) after writing pin_classifications.json.
+Run tb_builder.py after writing pin_classifications.json.
 
 Usage:
-    python scripts/phase_a.py <lib> <cell> [--vdd <volts>]
+    python scripts/symbol_export.py <lib> <cell> [--vdd <volts>]
 
 Outputs:
     SIM-IO/output/<timestamp>/pin_info.json
@@ -24,17 +24,11 @@ import re
 import sys
 from pathlib import Path
 
-# Path setup — scripts/ lives one level below SIM-IO root
-_SIM_IO = Path(__file__).resolve().parent.parent
-for _p in (
-    _SIM_IO,
-    _SIM_IO.parent / "virtuoso-bridge-lite" / "src",
-    _SIM_IO.parent / "io-ring-orchestrator-T28",
-):
-    if str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
-
 from virtuoso_bridge import VirtuosoClient
+
+_SIM_IO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_SIM_IO))
+
 from sim_io.flow import (
     PhaseAResult,
     SimFlowResult,
@@ -48,14 +42,15 @@ from sim_io.flow import (
 from sim_io.pin_types import write_pin_info_json
 
 
-def run_phase_a(
+def run_symbol_export(
     lib: str,
     primary_cell: str,
     *,
     vdd_value: float = 1.8,
+    debug: bool = False,
     client: VirtuosoClient | None = None,
 ) -> PhaseAResult:
-    """Phase A: symbol export + redistribution + pin extraction.
+    """Symbol export + redistribution + pin extraction.
 
     Steps:
       1. TSG: generate symbol view from schematic
@@ -91,7 +86,7 @@ def run_phase_a(
         log_skill_code(run_dir, il_file)
 
     print(f"\n{'='*60}")
-    print(f" Phase A: {lib}/{primary_cell}  (VDD={vdd_value}V)")
+    print(f" Symbol Export: {lib}/{primary_cell}  (VDD={vdd_value}V)")
     print(f" Output:  {run_dir}")
     print(f"{'='*60}\n")
 
@@ -99,7 +94,7 @@ def run_phase_a(
     symbol_ok = export_symbol(client, lib, primary_cell)
 
     # Step 2: Redistribute symbol pins (extract → calculate → apply)
-    redistributed = redistribute_symbol(client, lib, primary_cell, run_dir)
+    redistributed = redistribute_symbol(client, lib, primary_cell, run_dir, debug=debug)
 
     # Step 3: Extract pin info from redistributed symbol
     pins = extract_dut_pins(client, lib, primary_cell)
@@ -109,7 +104,7 @@ def run_phase_a(
             print(f"[step3] WARNING: pin {pin.name} side={pin.side!r}, correcting to 'left'")
             pin.side = "left"
 
-    # Write pin_info.json — Phase A ends here
+    # Write pin_info.json — symbol export ends here
     write_pin_info_json(pins, lib, primary_cell, vdd_value, run_dir / "pin_info.json")
 
     result = PhaseAResult(
@@ -124,30 +119,36 @@ def run_phase_a(
     result.save(run_dir)
 
     print(f"\n{'='*60}")
-    print(f" Phase A Complete")
+    print(f" Symbol Export Complete")
     print(f"  pin_info.json → {run_dir / 'pin_info.json'}")
     print(f"")
     print(f"  Next: read references/pin_classification.md + pin_info.json,")
     print(f"        classify every pin, write pin_classifications.json")
     print(f"        to {run_dir}")
-    print(f"  Then: python scripts/phase_b.py")
+    print(f"  Then: python scripts/tb_builder.py")
     print(f"{'='*60}\n")
 
     return result
 
 
+# Backward compat alias
+run_phase_a = run_symbol_export
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="SIM-IO Phase A — symbol export, redistribution, pin extraction"
+        description="SIM-IO Symbol Export — symbol generation, redistribution, pin extraction"
     )
     parser.add_argument("lib", help="Virtuoso library name")
     parser.add_argument("cell", help="Primary cell name (must have schematic view)")
     parser.add_argument("--vdd", type=float, default=1.8, metavar="V",
                         help="VDD supply voltage in volts (default: 1.8)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Write debug JSON files (layout_result.json)")
     args = parser.parse_args()
 
     try:
-        run_phase_a(args.lib, args.cell, vdd_value=args.vdd)
+        run_symbol_export(args.lib, args.cell, vdd_value=args.vdd, debug=args.debug)
         sys.exit(0)
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

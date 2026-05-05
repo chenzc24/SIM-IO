@@ -128,19 +128,25 @@ def fix_maestro_results(results: dict) -> dict:
     if not raw_csv:
         return results
 
-    # Check if any output value looks like a spec expression (mis-parsed)
-    needs_fix = False
-    for pt in results.get("points", []):
-        for out_name, info in (pt.get("outputs") or {}).items():
-            val = (info.get("value", "") or "").strip()
-            if val and (val.startswith(">") or val.startswith("<")):
-                needs_fix = True
-                break
-        if needs_fix:
-            break
+    # If upstream returned empty points, always try re-parsing with our
+    # single-run CSV parser — the upstream reader may fail entirely on the
+    # 7-col format (extra "Nominal Spec" column).
+    has_points = bool(results.get("points"))
 
-    if not needs_fix:
-        return results
+    if has_points:
+        # Check if any output value looks like a spec expression (mis-parsed)
+        needs_fix = False
+        for pt in results.get("points", []):
+            for out_name, info in (pt.get("outputs") or {}).items():
+                val = (info.get("value", "") or "").strip()
+                if val and (val.startswith(">") or val.startswith("<")):
+                    needs_fix = True
+                    break
+            if needs_fix:
+                break
+
+        if not needs_fix:
+            return results
 
     # Re-parse with the fixed single-run CSV parser
     history = results.get("history", "")

@@ -16,16 +16,9 @@ Or let build_maestro_setup manage the session lifecycle itself
 
 from __future__ import annotations
 
-import sys
+
 from pathlib import Path
 from typing import Optional
-
-_PKG_DIR = Path(__file__).resolve().parent
-_SIM_IO = _PKG_DIR.parent.parent
-_BRIDGE_LITE = _SIM_IO.parent / "virtuoso-bridge-lite" / "src"
-for p in (_BRIDGE_LITE,):
-    if str(p) not in sys.path:
-        sys.path.insert(0, str(p))
 
 from virtuoso_bridge import VirtuosoClient
 from virtuoso_bridge.virtuoso.maestro import (

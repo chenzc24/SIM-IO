@@ -18,7 +18,6 @@ from pathlib import Path
 
 _PKG_DIR = Path(__file__).resolve().parent
 _SIM_IO = _PKG_DIR.parent.parent
-sys.path.insert(0, str(_SIM_IO.parent / "virtuoso-bridge-lite" / "src"))
 
 from virtuoso_bridge import VirtuosoClient
 
@@ -34,7 +33,7 @@ from sim_io.symbol.layout_engine import (
 _SKILL_DIR = _SIM_IO / "skill_code"
 
 
-def run(lib: str, cell: str):
+def run(lib: str, cell: str, *, debug: bool = False):
     client = VirtuosoClient.from_env()
     run_dir = create_run_dir()
 
@@ -89,16 +88,17 @@ def run(lib: str, cell: str):
         count = sum(1 for p in result.pins if p.side.value == side_name)
         print(f"  {side_name}: {count} pins")
 
-    # Save layout result as JSON
-    layout_data = {
-        "lib": lib, "cell": cell,
-        "body": {k: v for k, v in asdict(body).items()},
-        "pins": [{k: (v.value if isinstance(v, Side) else v)
-                  for k, v in asdict(p).items()} for p in result.pins],
-    }
-    (run_dir / "layout_result.json").write_text(
-        json.dumps(layout_data, indent=2), encoding="utf-8"
-    )
+    # Save layout result as JSON (debug only)
+    if debug:
+        layout_data = {
+            "lib": lib, "cell": cell,
+            "body": {k: v for k, v in asdict(body).items()},
+            "pins": [{k: (v.value if isinstance(v, Side) else v)
+                      for k, v in asdict(p).items()} for p in result.pins],
+        }
+        (run_dir / "layout_result.json").write_text(
+            json.dumps(layout_data, indent=2), encoding="utf-8"
+        )
 
     # ── Step 3: Apply ─────────────────────────────────────────
     print("\n=== Step 3: Apply layout ===")
@@ -131,7 +131,8 @@ def run(lib: str, cell: str):
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: python symbol_redistribute.py <lib> <cell>")
+        print("Usage: python symbol_redistribute.py <lib> <cell> [--debug]")
         print("Example: python symbol_redistribute.py LLM_Layout_Design_Lab IO_RING_12x12")
         sys.exit(1)
-    run(sys.argv[1], sys.argv[2])
+    debug = "--debug" in sys.argv
+    run(sys.argv[1], sys.argv[2], debug=debug)

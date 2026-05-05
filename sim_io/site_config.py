@@ -36,16 +36,13 @@ def _discover_mmsim_root() -> str:
     Returns the MMSIM root path, or empty string if not found.
     """
     try:
-        # Try to get PATH from Virtuoso session via SKILL
-        _BRIDGE_LITE = _SIM_IO.parent / "virtuoso-bridge-lite" / "src"
-        import sys
-        if str(_BRIDGE_LITE) not in sys.path:
-            sys.path.insert(0, str(_BRIDGE_LITE))
         from virtuoso_bridge import VirtuosoClient
+        from sim_io.bridge.skill_call import skill_exec
 
         client = VirtuosoClient.from_env()
-        r = client.execute_skill('getShellEnvVar("PATH")', timeout=10)
-        path_val = (r.output or "").strip('"')
+        path_result = skill_exec(client, 'getShellEnvVar("PATH")', timeout=10,
+                                 context="mmsim_discovery_get_path", fail_ok=True)
+        path_val = path_result.output.strip('"')
         if not path_val or path_val.lower() == "nil":
             return ""
 
@@ -57,12 +54,11 @@ def _discover_mmsim_root() -> str:
             # Typical MMSIM install: /path/to/MMSIM221/tools/bin/spectre
             # The MMSIM_ROOT is /path/to/MMSIM221
             if entry.endswith("/tools/bin") or entry.endswith("/tools/bin/64bit"):
-                # Check if spectre exists in this path
-                spectre_check = client.execute_skill(
-                    f'isFile("{entry}/spectre")', timeout=10
+                spectre_result = skill_exec(
+                    client, f'isFile("{entry}/spectre")', timeout=10,
+                    context="mmsim_discovery_check_spectre", fail_ok=True,
                 )
-                if spectre_check.output and "t" in spectre_check.output.lower():
-                    # Derive MMSIM_ROOT: strip /tools/bin or /tools/bin/64bit
+                if spectre_result.output and "t" in spectre_result.output.lower():
                     mmsim_root = entry
                     if mmsim_root.endswith("/64bit"):
                         mmsim_root = mmsim_root[: mmsim_root.rfind("/64bit")]
@@ -72,7 +68,7 @@ def _discover_mmsim_root() -> str:
                     return mmsim_root
         return ""
     except Exception as e:
-        logger.debug("[site_config] MMSIM auto-discovery skipped: %s", e)
+        logger.warning("[site_config] MMSIM auto-discovery failed: %s", e)
         return ""
 
 

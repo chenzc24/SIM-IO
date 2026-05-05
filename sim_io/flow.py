@@ -1,8 +1,8 @@
 """
 sim_io.flow — Building blocks for the SIM-IO pipeline.
 
-Step functions and dataclasses used by scripts/phase_a.py and scripts/phase_b.py.
-Do not call run_phase_a / run_phase_b from here — those live in the scripts.
+Step functions and dataclasses used by scripts/symbol_export.py, tb_builder.py, and maestro_runner.py.
+Do not call run_symbol_export / run_tb_builder / run_maestro_runner from here — those live in the scripts.
 """
 
 from __future__ import annotations
@@ -10,23 +10,12 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import sys
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-# Resolve paths — this file lives in SIM-IO/sim_io/
-_PKG_DIR = Path(__file__).resolve().parent
-_SIM_IO = _PKG_DIR.parent
-_BRIDGE_LITE = _SIM_IO.parent / "virtuoso-bridge-lite" / "src"
-_T28_ROOT = _SIM_IO.parent / "io-ring-orchestrator-T28"
-for p in (_BRIDGE_LITE, _T28_ROOT):
-    if str(p) not in sys.path:
-        sys.path.insert(0, str(p))
-
 from virtuoso_bridge import VirtuosoClient
-from io_ring.bridge import load_skill_file, rb_exec
 from sim_io.bridge.edit_patterns import (
     batch_ops,
     label_term,
@@ -53,7 +42,9 @@ from sim_io.pin_types import (
     build_classification_map,
     get_rule_for_pin,
 )
+from sim_io.bridge.skill_call import skill_exec, SkillExecutionError
 
+_SIM_IO = Path(__file__).resolve().parent.parent
 SKILL_DIR = _SIM_IO / "skill_code"
 _OUTPUT_ROOT = _SIM_IO / "output"
 
@@ -159,7 +150,7 @@ class PhaseAResult:
     """Result of Phase A: symbol export + redistribution + pin extraction.
 
     Phase A ends after writing ``pin_info.json`` so the LLM can classify pins.
-    Pass this to ``run_phase_b()`` after writing ``pin_classifications.json``
+    Pass this to ``run_tb_builder()`` / ``run_maestro_runner()`` after writing ``pin_classifications.json``
     to the run directory.
 
     ``tb_cell`` is always ``f"{primary_cell}_tb"`` — TB creation happens in
@@ -203,28 +194,33 @@ def export_symbol(client: VirtuosoClient, lib: str, cell: str) -> bool:
     Returns True if symbol was created (or already existed).
     """
     # Check if symbol already exists
-    r = client.execute_skill(f'ddGetObj("{lib}" "{cell}")~>views~>name')
-    views = re.findall(r'"([^"]+)"', r.output or "")
+    r = skill_exec(client, f'ddGetObj("{lib}" "{cell}")~>views~>name',
+                   context="export_symbol_check", fail_ok=True)
+    views = re.findall(r'"([^"]+)"', r.output)
     if "symbol" in views:
         print(f"[step1] Symbol already exists: {lib}/{cell}/symbol")
         return True
 
     # Set geometric pin sorting (preserves schematic spatial layout)
-    client.execute_skill('schSetEnv("ssgSortPins" "geometric")')
+    skill_exec(client, 'schSetEnv("ssgSortPins" "geometric")',
+               context="export_symbol_set_sorting")
 
     # TSG two-call pipeline
-    r = client.execute_skill(
+    r = skill_exec(
+        client,
         f'let((pl) '
         f'pl = schSchemToPinList("{lib}" "{cell}" "schematic") '
-        f'schPinListToSymbol("{lib}" "{cell}" "symbol" pl))'
+        f'schPinListToSymbol("{lib}" "{cell}" "symbol" pl))',
+        context="export_symbol_tsg", fail_ok=True,
     )
-    if r.errors:
+    if not r.ok:
         print(f"[step1] ERROR: TSG failed: {r.errors}")
         return False
 
     # Verify
-    r = client.execute_skill(f'ddGetObj("{lib}" "{cell}")~>views~>name')
-    views = re.findall(r'"([^"]+)"', r.output or "")
+    r = skill_exec(client, f'ddGetObj("{lib}" "{cell}")~>views~>name',
+                   context="export_symbol_verify", fail_ok=True)
+    views = re.findall(r'"([^"]+)"', r.output)
     ok = "symbol" in views
     print(f"[step1] Symbol export: {'OK' if ok else 'FAILED'} — views: {views}")
     return ok
@@ -237,6 +233,8 @@ def redistribute_symbol(
     lib: str,
     cell: str,
     run_dir: Path,
+    *,
+    debug: bool = False,
 ) -> bool:
     """Redistribute symbol pins on 2 sides (left=outer, right=CORE/duplicate).
 
@@ -251,14 +249,18 @@ def redistribute_symbol(
     print(f"[step2] Redistributing symbol pins for {lib}/{cell}")
 
     # 2a: Fresh TSG — delete old symbol and regenerate
-    client.execute_skill(f'ddDeleteCellView("{lib}" "{cell}" "symbol")')
-    client.execute_skill('schSetEnv("ssgSortPins" "geometric")')
-    r = client.execute_skill(
+    skill_exec(client, f'ddDeleteCellView("{lib}" "{cell}" "symbol")',
+               context="redistribute_delete_symbol", fail_ok=True)
+    skill_exec(client, 'schSetEnv("ssgSortPins" "geometric")',
+               context="redistribute_set_sorting")
+    r = skill_exec(
+        client,
         f'let((pl) '
         f'pl = schSchemToPinList("{lib}" "{cell}" "schematic") '
-        f'schPinListToSymbol("{lib}" "{cell}" "symbol" pl))'
+        f'schPinListToSymbol("{lib}" "{cell}" "symbol" pl))',
+        context="redistribute_tsg", fail_ok=True,
     )
-    if r.errors:
+    if not r.ok:
         print(f"[step2a] ERROR: TSG failed: {r.errors}")
         return False
     print(f"[step2a] Fresh TSG: OK")
@@ -268,8 +270,9 @@ def redistribute_symbol(
     if not load_r.ok:
         print(f"[step2b] ERROR loading extractor: {load_r.errors}")
         return False
-    r = client.execute_skill(f'extractSymbolInfo("{lib}" "{cell}")', timeout=60)
-    if r.errors:
+    r = skill_exec(client, f'extractSymbolInfo("{lib}" "{cell}")',
+                   timeout=60, context="redistribute_extract", fail_ok=True)
+    if not r.ok:
         print(f"[step2b] ERROR extracting: {r.errors}")
         return False
 
@@ -288,16 +291,17 @@ def redistribute_symbol(
         count = sum(1 for p in result.pins if p.side.value == side_name)
         print(f"[step2c] {side_name}: {count} pins")
 
-    # Save layout result
-    layout_data = {
-        "lib": lib, "cell": cell,
-        "body": {k: v for k, v in asdict(body).items()},
-        "pins": [{k: (v.value if isinstance(v, Side) else v)
-                  for k, v in asdict(p).items()} for p in result.pins],
-    }
-    (run_dir / "layout_result.json").write_text(
-        json.dumps(layout_data, indent=2), encoding="utf-8"
-    )
+    # Save layout result (debug only)
+    if debug:
+        layout_data = {
+            "lib": lib, "cell": cell,
+            "body": {k: v for k, v in asdict(body).items()},
+            "pins": [{k: (v.value if isinstance(v, Side) else v)
+                      for k, v in asdict(p).items()} for p in result.pins],
+        }
+        (run_dir / "layout_result.json").write_text(
+            json.dumps(layout_data, indent=2), encoding="utf-8"
+        )
 
     # 2d: Apply layout
     skill_code = generate_apply_skill(lib, cell, result, engine.config)
@@ -312,9 +316,9 @@ def redistribute_symbol(
 
     # Verify
     sym = f'dbOpenCellViewByType("{lib}" "{cell}" "symbol" nil "r")'
-    r = client.execute_skill(f'{sym}~>bBox')
+    r = skill_exec(client, f'{sym}~>bBox', context="redistribute_verify_bbox", fail_ok=True)
     print(f"[step2] Verify bBox: {r.output}")
-    r = client.execute_skill(f'length({sym}~>terminals)')
+    r = skill_exec(client, f'length({sym}~>terminals)', context="redistribute_verify_terms", fail_ok=True)
     print(f"[step2] Verify terminals: {r.output}")
 
     return True
@@ -338,14 +342,16 @@ def symbol_move_pin(
     is re-oriented to extend outward from the body based on ``side``
     (one of "left"/"right"/"top"/"bottom").
     """
-    load_skill_file(str(SKILL_DIR / "symbol_move_pin.il"))
-    r = client.execute_skill(
-        f'symbolMovePin("{lib}" "{cell}" "{pin_name}" {x:g} {y:g} "{side}")'
+    client.load_il(str(SKILL_DIR / "symbol_move_pin.il"))
+    r = skill_exec(
+        client,
+        f'symbolMovePin("{lib}" "{cell}" "{pin_name}" {x:g} {y:g} "{side}")',
+        context=f"symbol_move_pin_{pin_name}", fail_ok=True,
     )
-    if r.errors:
+    if not r.ok:
         print(f"[symbol_move_pin] ERROR: {r.errors}")
         return False
-    ok = "MOVE-PIN" in (r.output or "")
+    ok = "MOVE-PIN" in r.output
     if ok:
         print(f"[symbol_move_pin] {pin_name} -> ({x:.3f}, {y:.3f})")
     else:
@@ -363,8 +369,10 @@ def create_tb_cellview(client: VirtuosoClient, lib: str, primary_cell: str) -> s
     tb_cell = f"{primary_cell}_tb"
 
     # Create fresh (mode "w") — overwrites if exists
-    r = client.execute_skill(
-        f'dbOpenCellViewByType("{lib}" "{tb_cell}" "schematic" "schematic" "w")'
+    r = skill_exec(
+        client,
+        f'dbOpenCellViewByType("{lib}" "{tb_cell}" "schematic" "schematic" "w")',
+        context="create_tb_cellview", fail_ok=True,
     )
     if not r.output or r.output.strip().lower() == "nil":
         raise RuntimeError(
@@ -373,8 +381,10 @@ def create_tb_cellview(client: VirtuosoClient, lib: str, primary_cell: str) -> s
         )
 
     # Save the empty cellview
-    client.execute_skill(
-        f'dbSave(dbOpenCellViewByType("{lib}" "{tb_cell}" "schematic" "schematic" "a"))'
+    skill_exec(
+        client,
+        f'dbSave(dbOpenCellViewByType("{lib}" "{tb_cell}" "schematic" "schematic" "a"))',
+        context="create_tb_cellview_save",
     )
     print(f"[step3] Created: {lib}/{tb_cell}/schematic")
     return tb_cell
@@ -382,10 +392,10 @@ def create_tb_cellview(client: VirtuosoClient, lib: str, primary_cell: str) -> s
 
 # ── Step 4a: Place DUT Instance ─────────────────────────────
 
-def place_dut(lib: str, tb_cell: str, primary_cell: str) -> bool:
+def place_dut(client: VirtuosoClient, lib: str, tb_cell: str, primary_cell: str) -> bool:
     """Place the primary cell's symbol as DUT instance in _tb schematic."""
     ops = [create_inst(lib, primary_cell, "symbol", "DUT", 2.5, 0.0, "R0")]
-    batch_ops(lib, tb_cell, ops)
+    batch_ops(client, lib, tb_cell, ops)
     print(f"[step4a] DUT placed: OK")
     return True
 
@@ -402,19 +412,22 @@ def extract_dut_pins(client: VirtuosoClient, lib: str, primary_cell: str) -> lis
     sym_cv = f'dbOpenCellViewByType("{lib}" "{primary_cell}" "symbol" nil "r")'
 
     # Get terminal names
-    r_names = client.execute_skill(f'{sym_cv}~>terminals~>name')
-    names = re.findall(r'"([^"]+)"', r_names.output or "")
+    r_names = skill_exec(client, f'{sym_cv}~>terminals~>name',
+                         context="extract_pins_names", fail_ok=True)
+    names = re.findall(r'"([^"]+)"', r_names.output)
     if not names:
         print(f"[step4b] ERROR: No terminals found in {lib}/{primary_cell}/symbol")
         return []
 
     # Get terminal directions
-    r_dirs = client.execute_skill(f'{sym_cv}~>terminals~>direction')
-    directions = re.findall(r'"([^"]+)"', r_dirs.output or "")
+    r_dirs = skill_exec(client, f'{sym_cv}~>terminals~>direction',
+                        context="extract_pins_dirs", fail_ok=True)
+    directions = re.findall(r'"([^"]+)"', r_dirs.output)
 
     # Get symbol bBox edges for side classification
-    r_bbox = client.execute_skill(f'{sym_cv}~>bBox')
-    bbox_match = re.findall(r'[-\d.]+', r_bbox.output or "")
+    r_bbox = skill_exec(client, f'{sym_cv}~>bBox',
+                        context="extract_pins_bbox", fail_ok=True)
+    bbox_match = re.findall(r'[-\d.]+', r_bbox.output)
     if len(bbox_match) >= 4:
         body_L = float(bbox_match[0])
         body_B = float(bbox_match[1])
@@ -428,10 +441,12 @@ def extract_dut_pins(client: VirtuosoClient, lib: str, primary_cell: str) -> lis
         direction = directions[i] if i < len(directions) else "inputOutput"
 
         # Get first pin figure bBox (handles multi-pin terminals like VSS)
-        r_pin = client.execute_skill(
-            f'car(car(nth({i} {sym_cv}~>terminals)~>pins)~>figs)~>bBox'
+        r_pin = skill_exec(
+            client,
+            f'car(car(nth({i} {sym_cv}~>terminals)~>pins)~>figs)~>bBox',
+            context=f"extract_pin_{name}", fail_ok=True,
         )
-        pin_match = re.findall(r'[-\d.]+', r_pin.output or "")
+        pin_match = re.findall(r'[-\d.]+', r_pin.output)
         if len(pin_match) >= 4:
             px = (float(pin_match[0]) + float(pin_match[2])) / 2.0
             py = (float(pin_match[1]) + float(pin_match[3])) / 2.0
@@ -456,6 +471,7 @@ def extract_dut_pins(client: VirtuosoClient, lib: str, primary_cell: str) -> lis
 
 
 def add_wire_labels(
+    client: VirtuosoClient,
     lib: str,
     tb_cell: str,
     pins: list[PinInfo],
@@ -497,7 +513,7 @@ def add_wire_labels(
             justification=cfg[pin.side]["label_align"],
         ))
 
-    batch_ops(lib, tb_cell, ops)
+    batch_ops(client, lib, tb_cell, ops)
     print(f"[step4c] Added {len(labeled_nets)} wire stubs on DUT pins: OK")
     return labeled_nets
 
@@ -522,8 +538,7 @@ def _source_load_position(
         return (px - offset, py)
     if side == "right":
         return (px + offset, py)
-    print(f"[WARN] _source_load_position: unexpected side={side!r}, treating as left")
-    return (px - offset, py)
+    raise ValueError(f"_source_load_position: unexpected side={side!r}, expected 'left' or 'right'")
 
 
 def _resolve_param_value(value: str, vdd_value: float) -> str:
@@ -572,6 +587,7 @@ def _set_cdf_params(
     params: dict,
     vdd_value: float,
     *,
+    client: VirtuosoClient,
     resolve_vdd: bool = False,
 ) -> None:
     """Set CDF parameters on an instance via setInstParams SKILL function."""
@@ -586,9 +602,9 @@ def _set_cdf_params(
         f'setInstParams("{lib}" "{tb_cell}" "{inst_name}" '
         f"list({' '.join(pairs)}))"
     )
-    r = rb_exec(skill, timeout=30)
-    if "error" in r.lower():
-        print(f"[step4d] WARNING: CDF params failed for {inst_name}: {r}")
+    r = client.execute_skill(skill, timeout=30)
+    if r.errors or "error" in (r.output or "").lower():
+        print(f"[step4d] WARNING: CDF params failed for {inst_name}: {r.errors or r.output}")
 
 
 def place_sources_and_loads(
@@ -621,7 +637,7 @@ def place_sources_and_loads(
 
     Returns list of instance names placed.
     """
-    load_skill_file(str(SKILL_DIR / "set_inst_params.il"))
+    client.load_il(str(SKILL_DIR / "set_inst_params.il"))
     placed: list[str] = []
     ops: list[str] = []
     classifications = classifications or {}
@@ -868,13 +884,13 @@ def place_sources_and_loads(
                 ops.append(label_term(inst_name, "PLUS", pwr))
                 ops.append(label_term(inst_name, "MINUS", gnd))
 
-    batch_ops(lib, tb_cell, ops, timeout=120)
+    batch_ops(client, lib, tb_cell, ops, timeout=120)
 
     # ── Phase 5: CDF parameters ─────────────────────────────────────────────
     # PVSS devices (analog ground) — vdc ~0 but not exactly 0 to avoid
     # schematic warning (zero-voltage source shorted to ground).
     for pin_name in ground_pin_pvss:
-        _set_cdf_params(lib, tb_cell, f"PVSS_{pin_name}", {"vdc": "0.013"}, vdd_value)
+        _set_cdf_params(lib, tb_cell, f"PVSS_{pin_name}", {"vdc": "0.013"}, vdd_value, client=client)
 
     for pin in left_pins:
         cls = classifications.get(pin.name)
@@ -884,23 +900,23 @@ def place_sources_and_loads(
                 continue
             if dc == "digital_io_output":
                 lp = cls.load_params or {"c": "10p"}
-                _set_cdf_params(lib, tb_cell, f"LOAD_{pin.name}", lp, vdd_value)
+                _set_cdf_params(lib, tb_cell, f"LOAD_{pin.name}", lp, vdd_value, client=client)
                 continue
             if cls.stimulus and cls.stimulus_params:
                 _set_cdf_params(lib, tb_cell, f"SRC_{pin.name}",
-                                cls.stimulus_params, vdd_value, resolve_vdd=True)
+                                cls.stimulus_params, vdd_value, client=client, resolve_vdd=True)
             if cls.load and cls.load_params:
                 _set_cdf_params(lib, tb_cell, f"LOAD_{pin.name}",
-                                cls.load_params, vdd_value, resolve_vdd=True)
+                                cls.load_params, vdd_value, client=client, resolve_vdd=True)
             if dc == "digital_io_input":
                 _set_cdf_params(lib, tb_cell, f"INNER_{pin.name}",
-                                {"c": "10p"}, vdd_value)
+                                {"c": "10p"}, vdd_value, client=client)
             elif cls.inner_stimulus and cls.inner_params and cls.inner_stimulus != "noConn":
                 _set_cdf_params(lib, tb_cell, f"INNER_{pin.name}",
-                                cls.inner_params, vdd_value, resolve_vdd=True)
+                                cls.inner_params, vdd_value, client=client, resolve_vdd=True)
             if cls.inner_load and cls.inner_load_params:
                 _set_cdf_params(lib, tb_cell, f"INNER_LOAD_{pin.name}",
-                                cls.inner_load_params, vdd_value, resolve_vdd=True)
+                                cls.inner_load_params, vdd_value, client=client, resolve_vdd=True)
         else:
             pad_type = classify_pin_heuristic(pin)
             if pad_type == "ground":
@@ -913,11 +929,11 @@ def place_sources_and_loads(
                 if cfg and cfg.get("params"):
                     inst_name = f"{'SRC' if role == 'source' else 'LOAD'}_{pin.name}"
                     _set_cdf_params(lib, tb_cell, inst_name,
-                                    cfg["params"], vdd_value, resolve_vdd=True)
+                                    cfg["params"], vdd_value, client=client, resolve_vdd=True)
 
     if result and result.shared_output_vpulse and "INNER_DIG_OUT" in placed:
         _set_cdf_params(lib, tb_cell, "INNER_DIG_OUT",
-                        result.shared_output_vpulse, vdd_value, resolve_vdd=True)
+                        result.shared_output_vpulse, vdd_value, client=client, resolve_vdd=True)
 
     if result and result.digital_supply_pairs:
         for pair in result.digital_supply_pairs:
@@ -925,11 +941,11 @@ def place_sources_and_loads(
             inst_name = f"ISUPPLY_{pwr}"
             if pwr and inst_name in placed:
                 _set_cdf_params(lib, tb_cell, inst_name,
-                                {"idc": pair.get("idc", "5m")}, vdd_value)
+                                {"idc": pair.get("idc", "5m")}, vdd_value, client=client)
 
     # Final check-and-save: setInstParams modifies CDF without calling schCheck,
     # which causes OSSHNL-109 "modified since last extraction" on netlist generation.
-    rb_exec(
+    client.execute_skill(
         f'let((cv) cv = dbOpenCellViewByType("{lib}" "{tb_cell}" "schematic" "schematic" "a") '
         f'schCheck(cv) dbSave(cv) t)',
         timeout=30,
