@@ -55,6 +55,14 @@ def golden_for_pin_type(pad_type: str, vdd: float) -> dict:
             "iavg_max": 0.1,           # < 100 mA quiescent per power pin
             "pavg_max": vdd * 0.1,     # < 100mA * VDD power budget
         },
+        "analog_power": {
+            "vmax_min": vdd * 0.4,     # Analog bias must be present
+            "iavg_max": 0.1,           # < 100 mA
+            "pavg_max": vdd * 0.1,     # Power budget similar to digital power
+        },
+        "bias_current": {
+            "iavg_max": 0.1,           # < 100 mA
+        },
         "analog_input": {
             "vmax_min": vdd * 0.4,     # At minimum, DC bias should be present
         },

@@ -36,6 +36,7 @@ from virtuoso_bridge import VirtuosoClient
 from sim_io.flow import (
     PhaseAResult,
     SimFlowResult,
+    load_llm_result,
     load_llm_classifications,
     classify_pin,
     create_tb_cellview,
@@ -43,6 +44,7 @@ from sim_io.flow import (
     add_wire_labels,
     place_sources_and_loads,
 )
+from sim_io.pin_types import ClassificationResult
 from sim_io.pin_types import PinClassification, PinInfo
 
 
@@ -75,9 +77,11 @@ def run_phase_b(
     vdd_value = phase_a.vdd_value
 
     # Load LLM classifications from run_dir/pin_classifications.json
-    classifications: dict[str, PinClassification] = load_llm_classifications(
+    classif_result: ClassificationResult | None = load_llm_result(
         run_dir, cell=primary_cell
     )
+    from sim_io.pin_types import build_classification_map
+    classifications = build_classification_map(classif_result) if classif_result else {}
 
     print(f"\n{'='*60}")
     print(f" Phase B: {lib}/{tb_cell}  (LLM={bool(classifications)})")
@@ -90,12 +94,13 @@ def run_phase_b(
     place_dut(lib, tb_cell, primary_cell)
 
     # Step 4c: Add wire labels on DUT pins
-    labels = add_wire_labels(lib, tb_cell, pins) if pins else []
+    labels = add_wire_labels(lib, tb_cell, pins, result=classif_result) if pins else []
 
     # Step 4d: Place sources & loads based on LLM classification
     sources = place_sources_and_loads(
         lib, tb_cell, pins,
         classifications=classifications,
+        result=classif_result,
         vdd_value=vdd_value,
         client=client,
     ) if pins else []

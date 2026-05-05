@@ -23,6 +23,7 @@ from sim_io.maestro.run import (
 )
 from sim_io.maestro.results import parse_maestro_measurements
 from sim_io.maestro.waves import plot_maestro_waves
+from sim_io.maestro.reader import fix_maestro_results
 
 __all__ = [
     "ensure_maestro_view",
@@ -33,4 +34,5 @@ __all__ = [
     "MaestroSimResult",
     "parse_maestro_measurements",
     "plot_maestro_waves",
+    "fix_maestro_results",
 ]

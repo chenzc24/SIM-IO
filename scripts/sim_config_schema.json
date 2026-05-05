@@ -1,9 +1,9 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "SimConfig",
-  "description": "LLM-generated simulation deck configuration for Spectre",
+  "description": "LLM-generated simulation deck configuration — measurement intent, not OCEAN syntax",
   "type": "object",
-  "required": ["design_vars", "model_includes", "analyses"],
+  "required": ["analyses"],
   "properties": {
     "lib": {
       "type": "string",
@@ -38,7 +38,7 @@
     },
     "model_includes": {
       "type": "array",
-      "description": "PDK model files with sections",
+      "description": "PDK model files with sections — leave empty [], injected by Phase B",
       "items": {
         "type": "object",
         "required": ["path", "section"],
@@ -80,6 +80,10 @@
           "stop": {
             "type": "string",
             "description": "Stop time for tran (e.g. '1u'), or stop value for sweep"
+          },
+          "maxstep": {
+            "type": "string",
+            "description": "Maximum time step for tran (e.g. '100p')"
           },
           "sweep": {
             "type": "object",
@@ -127,9 +131,58 @@
         }
       }
     },
+    "pin_measurements": {
+      "type": "object",
+      "description": "Per-pin measurement intent — the LLM decides WHAT to measure, code decides HOW",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["measures"],
+        "properties": {
+          "measures": {
+            "type": "array",
+            "description": "What to measure for this pin",
+            "items": {
+              "type": "string",
+              "enum": ["voltage", "current", "power", "custom"]
+            }
+          },
+          "spec": {
+            "type": "object",
+            "description": "Pass/fail spec constraints",
+            "properties": {
+              "i_max": {
+                "type": "string",
+                "description": "Current must be below this value (amps), e.g. '0.1'"
+              },
+              "p_max": {
+                "type": "string",
+                "description": "Power must be below this value (watts), e.g. '0.5'"
+              },
+              "vmax_above": {
+                "type": "string",
+                "description": "Peak voltage must be above this (supports *VDD), e.g. '0.9*VDD'"
+              },
+              "vmin_below": {
+                "type": "string",
+                "description": "Min voltage must be below this (supports *VDD), e.g. '0.1*VDD'"
+              }
+            },
+            "additionalProperties": false
+          },
+          "custom_expr": {
+            "type": "string",
+            "description": "OCEAN expression for custom measurement (only when 'custom' in measures)"
+          },
+          "custom_name": {
+            "type": "string",
+            "description": "Output name for custom measurement"
+          }
+        }
+      }
+    },
     "save_signals": {
       "type": "array",
-      "description": "Specific signals to save (if empty, uses save_default)",
+      "description": "Specific signals to save — prefer pin_measurements instead",
       "items": {
         "type": "object",
         "required": ["signal"],
@@ -143,7 +196,7 @@
     },
     "outputs": {
       "type": "array",
-      "description": "Named output expressions",
+      "description": "Named output expressions — prefer pin_measurements instead",
       "items": {
         "type": "object",
         "required": ["name", "expression"],
@@ -154,20 +207,20 @@
           },
           "expression": {
             "type": "string",
-            "description": "Spectre expression, e.g. 'VOUT / (VIP - VIN)'"
+            "description": "OCEAN expression, e.g. 'VOUT / (VIP - VIN)'"
           },
           "eval_type": {
             "type": "string",
-            "enum": ["point", "wave"],
+            "enum": ["point"],
             "default": "point",
-            "description": "Evaluation type: point (scalar) or wave (waveform)"
+            "description": "Evaluation type — always 'point' for Maestro"
           }
         }
       }
     },
     "info_statements": {
       "type": "array",
-      "description": "Info statements for Spectre output",
+      "description": "Info statements for Spectre output — code injects standard set",
       "items": {
         "type": "object",
         "required": ["info_type", "what"],
@@ -205,7 +258,7 @@
       "type": "string",
       "enum": ["allpub", "all", ""],
       "default": "allpub",
-      "description": "Default save mode when no specific save_signals"
+      "description": "Default save mode — always specify 'allpub'; code auto-upgrades to 'all' when needed"
     }
   }
 }

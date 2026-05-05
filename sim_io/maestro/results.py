@@ -62,16 +62,27 @@ def parse_maestro_measurements(
 
     # Flatten all per-point scalar outputs into {output_name: float}.
     # Single Run mode has exactly one point; sweeps have more — take first.
+    #
+    # Maestro CSV column mapping is inconsistent between versions and
+    # single-run vs sweep modes.  Sometimes the "Nominal" column contains
+    # the spec expression (e.g. "> 0.9*1.8") and the "Spec" column holds
+    # the actual measurement (e.g. "1.7").  We try both fields and pick
+    # whichever parses as a float.
     outputs: dict[str, float] = {}
     for pt in mae_result.points:
         for out_name, info in (pt.get("outputs") or {}).items():
-            val_str = (info.get("value", "") if isinstance(info, dict) else str(info)).strip()
-            if not val_str or val_str.lower() in ("nil", "n/a", "---", ""):
+            if not isinstance(info, dict):
                 continue
-            try:
-                outputs[out_name] = float(val_str)
-            except (ValueError, TypeError):
-                pass
+            # Try "value" then "spec" — whichever yields a float first
+            for field in ("value", "spec"):
+                val_str = (info.get(field) or "").strip()
+                if not val_str or val_str.lower() in ("nil", "n/a", "---", ""):
+                    continue
+                try:
+                    outputs[out_name] = float(val_str)
+                    break
+                except (ValueError, TypeError):
+                    continue
         break  # only use first point for Single Run
 
     pin_measurements: dict[str, dict] = {}

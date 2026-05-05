@@ -53,6 +53,7 @@ from sim_io.sim.config import (
     DesignVar,
     SimOptions,
     OutputExpression,
+    PinMeasurement,
     SaveSignal,
 )
 from sim_io.pin_types import PinInfo, classify_pin_heuristic
@@ -222,6 +223,137 @@ def _auto_generate_outputs(
 
     print(f"[maestro] Auto-generated outputs: {n_voltage} voltage, "
           f"{n_current} current, {n_power} power")
+    return current_sources
+
+
+# ── Build Outputs from LLM Measurement Intent ───────────────────
+
+def _build_outputs_from_measurements(
+    client: VirtuosoClient,
+    tname: str,
+    config: SimDeckConfig,
+    pins: list[PinInfo],
+    vdd_value: float,
+    session: str,
+    classifications: dict[str, "PinClassification"] | None = None,
+) -> list[str]:
+    """Translate LLM pin_measurements into Maestro output declarations.
+
+    The LLM specifies WHAT to measure (voltage, current, power, custom)
+    and spec constraints.  This function generates the correct OCEAN
+    expressions, eval_types, and save signals — the LLM never writes
+    OCEAN syntax directly.
+
+    Returns list of source instance names whose branch currents need
+    to be saved (e.g. ["SRC_VDD"]).
+    """
+    n_voltage = 0
+    n_current = 0
+    n_power = 0
+    n_custom = 0
+    current_sources: list[str] = []
+    measured_pins = set(config.pin_measurements.keys())
+
+    for pin_name, pm in config.pin_measurements.items():
+        if not pm.measures:
+            continue
+
+        sig_path = f"/{pin_name}"
+
+        # 1. Voltage net — always added when any measurement is requested
+        add_output(client, pin_name, tname,
+                   output_type="net", signal_name=sig_path,
+                   session=session)
+        n_voltage += 1
+
+        # 2. Voltage scalar outputs (vmax/vmin) for any pin with "voltage"
+        #    measurement.  Spec boundaries are optional — without them the
+        #    scalar is still useful for measurements.json and verify.
+        if "voltage" in pm.measures:
+            vmax_name = f"vmax_{pin_name}"
+            vmax_expr = _escape_ocean_expr(f'ymax(v("{sig_path}" ?result "tran"))')
+            add_output(client, vmax_name, tname,
+                       output_type="point", expr=vmax_expr,
+                       session=session)
+            if "vmax_above" in pm.spec:
+                threshold = pm.spec["vmax_above"].replace("VDD", str(vdd_value))
+                set_spec(client, vmax_name, tname,
+                         gt=threshold, session=session)
+
+            vmin_name = f"vmin_{pin_name}"
+            vmin_expr = _escape_ocean_expr(f'ymin(v("{sig_path}" ?result "tran"))')
+            add_output(client, vmin_name, tname,
+                       output_type="point", expr=vmin_expr,
+                       session=session)
+            if "vmin_below" in pm.spec:
+                threshold = pm.spec["vmin_below"].replace("VDD", str(vdd_value))
+                set_spec(client, vmin_name, tname,
+                         lt=threshold, session=session)
+
+        # 3. Current through source
+        if "current" in pm.measures:
+            src_name = f"SRC_{pin_name}"
+            current_sources.append(src_name)
+            i_name = f"I_{pin_name}"
+            i_expr = _escape_ocean_expr(
+                f'average(abs(i("{src_name}:p" ?result "tran")))'
+            )
+            add_output(client, i_name, tname,
+                       output_type="point", expr=i_expr,
+                       session=session)
+            set_spec(client, i_name, tname, gt="0", session=session)
+            if "i_max" in pm.spec:
+                set_spec(client, i_name, tname,
+                         lt=pm.spec["i_max"], session=session)
+            n_current += 1
+
+        # 4. Power expression
+        if "power" in pm.measures:
+            src_name = f"SRC_{pin_name}"
+            if src_name not in current_sources:
+                current_sources.append(src_name)
+            p_name = f"P_{pin_name}"
+            p_expr = _escape_ocean_expr(
+                f'average(abs(v("{sig_path}" ?result "tran") '
+                f'* i("{src_name}:p" ?result "tran")))'
+            )
+            add_output(client, p_name, tname,
+                       output_type="point", expr=p_expr,
+                       session=session)
+            set_spec(client, p_name, tname, gt="0", session=session)
+            if "p_max" in pm.spec:
+                set_spec(client, p_name, tname,
+                         lt=pm.spec["p_max"], session=session)
+            n_power += 1
+
+        # 5. Custom expression
+        if "custom" in pm.measures and pm.custom_expr:
+            out_name = pm.custom_name or f"custom_{pin_name}"
+            escaped = _escape_ocean_expr(pm.custom_expr)
+            add_output(client, out_name, tname,
+                       output_type="point", expr=escaped,
+                       session=session)
+            n_custom += 1
+
+    # Add voltage net for unlisted non-ground pins (debug baseline)
+    for pin in (pins or []):
+        if pin.name in measured_pins:
+            continue
+        if classifications and pin.name in classifications:
+            pad_type = classifications[pin.name].pin_type
+        else:
+            pad_type = classify_pin_heuristic(pin)
+        if pad_type in _SKIP_PIN_TYPES:
+            continue
+
+        sig_path = f"/{pin.name}"
+        add_output(client, pin.name, tname,
+                   output_type="net", signal_name=sig_path,
+                   session=session)
+        n_voltage += 1
+
+    print(f"[maestro] LLM-measurement outputs: {n_voltage} voltage, "
+          f"{n_current} current, {n_power} power, {n_custom} custom")
     return current_sources
 
 
@@ -492,6 +624,13 @@ def build_maestro_setup(
         save_val = config.save_default or "allpub"
         if has_power and save_val == "allpub":
             save_val = "all"
+        # Also upgrade if pin_measurements needs current/power
+        needs_current = any(
+            "current" in pm.measures or "power" in pm.measures
+            for pm in config.pin_measurements.values()
+        )
+        if needs_current and save_val == "allpub":
+            save_val = "all"
         env_parts.append(f'("saveSignals" "{save_val}")')
 
         # switchViewList: hierarchy traversal order for the netlister.
@@ -522,13 +661,30 @@ def build_maestro_setup(
               f"reltol={config.sim_options.reltol}")
 
         # Step 9: Add outputs
-        # If save_signals and outputs are both empty, auto-generate from pins.
+        # Priority: pin_measurements (LLM intent) > explicit outputs > auto-generate
         # Maestro only computes what's declared as outputs — unlike Spectre's
         # "save allpub", Maestro needs explicit output declarations.
+        has_pin_measurements = bool(config.pin_measurements)
         has_explicit_outputs = bool(config.save_signals) or bool(config.outputs)
 
-        if has_explicit_outputs:
-            # Explicit outputs from SimDeckConfig
+        if has_pin_measurements:
+            # Priority 1: LLM measurement intent → code translates to Maestro outputs
+            vdd = 1.8
+            for v in config.design_vars:
+                if v.name.upper() == "VDD":
+                    try:
+                        vdd = float(v.expression)
+                    except ValueError:
+                        pass
+                    break
+            current_sources = _build_outputs_from_measurements(
+                client, tname, config, pins or [], vdd, session,
+                classifications=classifications,
+            )
+            if current_sources:
+                print(f"[maestro] Current save signals needed for: {current_sources}")
+        elif has_explicit_outputs:
+            # Priority 2: Explicit outputs from SimDeckConfig (legacy)
             for sig in config.save_signals:
                 sig_path = _to_maestro_signal_path(sig.signal)
                 out_name = sig_path.lstrip("/").replace("/", "_")
@@ -544,7 +700,7 @@ def build_maestro_setup(
                            session=session)
                 print(f"[maestro] Output (expr): {out.name}")
         else:
-            # Auto-generate: voltage + current + power outputs with specs
+            # Priority 3: Auto-generate from pins + classification
             vdd = 1.8
             for v in config.design_vars:
                 if v.name.upper() == "VDD":
@@ -689,5 +845,6 @@ def _print_setup_summary(cfg: SimDeckConfig) -> None:
           f"reltol={cfg.sim_options.reltol}")
     print(f"  Save signals:   {len(cfg.save_signals)}")
     print(f"  Output exprs:   {len(cfg.outputs)}")
+    print(f"  Pin measurements: {len(cfg.pin_measurements)}")
     print(f"  Source:         {cfg.source or 'unknown'}")
     print(f"{'='*60}\n")

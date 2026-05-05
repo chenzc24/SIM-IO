@@ -135,28 +135,29 @@ Key principles (full rules in `references/pin_classification.md`):
 - **Maestro setup** (Step 4e) — configures analyses and outputs in Virtuoso Maestro
 - **Spectre deck** (Step 5) — controls netlist analyses, save statements, and power expressions
 
-Schema (see `scripts/sim_config_schema.json` for full spec):
+Schema (see `scripts/sim_config_schema.json` for full spec).
+The LLM specifies **measurement intent** via `pin_measurements` — the code translates
+intent into correct Maestro OCEAN expressions automatically. Never write raw OCEAN
+expressions in `outputs`; use `pin_measurements` instead.
+
 ```json
 {
   "analyses": [
-    {"name": "dcOp", "type": "dc", "enabled": true},
-    {"name": "tran", "type": "tran", "enabled": true,
+    {"name": "dc", "enabled": true},
+    {"name": "tran", "enabled": true,
      "stop": "<tstop>", "maxstep": "<tstop/1000>", "errpreset": "moderate"}
   ],
   "model_includes": [],
   "save_default": "allpub",
-  "outputs": [
-    {
-      "name": "SRC_VDD_pwr",
-      "expression": "integ(pwr(SRC_VDD), 0, <tstop>) / <tstop>",
-      "eval_type": "wave",
-      "from_analysis": "tran"
-    }
-  ]
+  "pin_measurements": {
+    "VDD": {"measures": ["voltage", "current", "power"], "spec": {"i_max": "0.1"}},
+    "D0":  {"measures": ["voltage"], "spec": {"vmax_above": "0.9*VDD", "vmin_below": "0.1*VDD"}},
+    "GND": {"measures": []}
+  }
 }
 ```
 
-One `outputs` entry per non-ground, non-noConn device. `model_includes` is always `[]` — Phase B injects PDK paths from `.env` automatically.
+One `pin_measurements` entry per DUT pin. `model_includes` is always `[]` — Phase B injects PDK paths from `.env` automatically. `save_default` is always `"allpub"` — code auto-upgrades to `"all"` when current/power measurements are detected.
 
 ---
 
@@ -288,7 +289,7 @@ output/<YYYYMMDD_HHMMSS>/
 - [ ] LLM: `pin_classifications.json` written to `<run_dir>/`, not to SIM-IO root
 - [ ] LLM: read `references/sim_config_rules.md` before writing sim config
 - [ ] LLM: `tstop` computed from max vpulse `per` × 10
-- [ ] LLM: `sim_config.json` written to `<run_dir>/` with one power output per non-ground device
+- [ ] LLM: `sim_config.json` written to `<run_dir>/` with `pin_measurements` for every DUT pin
 - [ ] Phase B exit 0: `{cell}_tb/schematic` created in Virtuoso
 - [ ] Phase B: `result.json` written to run directory
 - [ ] Sim (if requested): `measurements.json`, `verify.json`, and `plots/tran_maestro.svg` present in run directory

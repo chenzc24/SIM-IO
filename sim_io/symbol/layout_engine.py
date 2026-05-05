@@ -85,14 +85,14 @@ class SymbolInfo:
 
 @dataclass
 class LayoutConfig:
-    pin_pitch: float = 1.0
+    pin_pitch: float = 0.25
     wire_length: float = 0.375
-    end_margin: float = 2.0
+    end_margin: float = 0.5
     label_inset: float = 0.125
     core_label_inset: float = 0.3
     center_x: float = 2.5
     center_y: float = -0.5
-    body_width: float = 2.5
+    body_width: float = 7.5
     min_body_half: float = 0.125
 
 
@@ -506,7 +506,7 @@ def generate_apply_skill(
             lines.append(
                 f'  dbCreateLabel(cv list("pin" "label")'
                 f' list({lx:g} {ly:g}) "{name}"'
-                f' "centerRight" "R0" "stick" 0.125)')
+                f' "centerRight" "R0" "stick" 0.25)')
 
         elif pin.is_core:
             # ── Right-side CORE: move pin figure + create wire + move label ──
@@ -539,7 +539,7 @@ def generate_apply_skill(
                 f' s~>objType == "label" && s~>theLabel == "{name}"'
                 f' && abs(car(s~>xy) - {olx:g}) < 0.01'
                 f' && abs(cadr(s~>xy) - {oly:g}) < 0.01))')
-            lines.append(f'  when(lbl lbl~>xy = list({lx:g} {ly:g}) lbl~>justify = "centerRight" lbl~>height = 0.125)')
+            lines.append(f'  when(lbl lbl~>xy = list({lx:g} {ly:g}) lbl~>justify = "centerRight" lbl~>orient = "R0" lbl~>height = 0.25)')
 
         else:
             # ── Left-side non-CORE: move pin figure + create wire + move label ──
@@ -572,7 +572,7 @@ def generate_apply_skill(
                 f' s~>objType == "label" && s~>theLabel == "{name}"'
                 f' && abs(car(s~>xy) - {olx:g}) < 0.01'
                 f' && abs(cadr(s~>xy) - {oly:g}) < 0.01))')
-            lines.append(f'  when(lbl lbl~>xy = list({lx:g} {ly:g}) lbl~>justify = "centerLeft" lbl~>height = 0.125)')
+            lines.append(f'  when(lbl lbl~>xy = list({lx:g} {ly:g}) lbl~>justify = "centerLeft" lbl~>orient = "R0" lbl~>height = 0.25)')
 
     # Save + return
     lines.append(f'  dbSave(cv)')

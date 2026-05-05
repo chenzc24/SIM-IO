@@ -30,6 +30,7 @@ from io_ring.bridge import load_skill_file, rb_exec
 from sim_io.bridge.edit_patterns import (
     batch_ops,
     label_term,
+    label_term_directed,
     create_inst,
 )
 from sim_io.symbol.layout_engine import (
@@ -56,29 +57,34 @@ from sim_io.pin_types import (
 SKILL_DIR = _SIM_IO / "skill_code"
 _OUTPUT_ROOT = _SIM_IO / "output"
 
+# Shared net label used to connect all digital output _CORE pins to one vpulse.
+_DIG_OUT_CORE_NET = "DIG_OUT_CORE"
+
+# Global ground net — all source/load MINUS terminals label "gnd!" directly.
+# In Virtuoso "gnd!" is a built-in global net; no analogLib/gnd symbol needed.
+_GND_NET = "gnd!"
+
+
+def load_llm_result(run_dir: Path, *, cell: str = "") -> ClassificationResult | None:
+    """Load pin_classifications.json, returning the full ClassificationResult or None."""
+    run_path = run_dir / "pin_classifications.json"
+    if not run_path.exists():
+        print(f"[llm] No pin_classifications.json in {run_dir} — heuristic fallback.")
+        return None
+    result = load_pin_classifications(run_path)
+    if cell and result.cell and result.cell != cell:
+        print(f"[llm] WARNING: {run_path} has cell={result.cell!r}, "
+              f"expected {cell!r} — skipping stale file")
+        return None
+    print(f"[llm] Loaded {len(result.pins)} pin classifications from {run_path}")
+    return result
+
 
 def load_llm_classifications(run_dir: Path, *, cell: str = "") -> dict[str, PinClassification]:
-    """Load LLM pin classifications from run_dir/pin_classifications.json.
-
-    Returns a name→PinClassification map.  Returns empty dict (with a warning)
-    if the file does not exist — callers fall back to heuristic classification.
-
-    Validates the ``cell`` field in the JSON to catch stale files.
-    """
-    run_path = run_dir / "pin_classifications.json"
-
-    if run_path.exists():
-        result = load_pin_classifications(run_path)
-        if cell and result.cell and result.cell != cell:
-            print(f"[llm] WARNING: {run_path} has cell={result.cell!r}, "
-                  f"expected {cell!r} — skipping stale file")
-        else:
-            classifications = build_classification_map(result)
-            print(f"[llm] Loaded {len(classifications)} classifications from {run_path}")
-            return classifications
-
-    print(f"[llm] No pin_classifications.json in {run_dir} — using heuristic fallback. "
-          f"Write classifications to {run_path} for LLM-driven placement.")
+    """Backward-compat wrapper — returns name→PinClassification dict."""
+    r = load_llm_result(run_dir, cell=cell)
+    if r:
+        return build_classification_map(r)
     return {}
 
 
@@ -361,8 +367,10 @@ def create_tb_cellview(client: VirtuosoClient, lib: str, primary_cell: str) -> s
         f'dbOpenCellViewByType("{lib}" "{tb_cell}" "schematic" "schematic" "w")'
     )
     if not r.output or r.output.strip().lower() == "nil":
-        print(f"[step3] ERROR: Failed to create {lib}/{tb_cell}/schematic")
-        return tb_cell
+        raise RuntimeError(
+            f"Failed to create {lib}/{tb_cell}/schematic — "
+            "cellview may be open in GUI (close it first)"
+        )
 
     # Save the empty cellview
     client.execute_skill(
@@ -451,36 +459,46 @@ def add_wire_labels(
     lib: str,
     tb_cell: str,
     pins: list[PinInfo],
+    *,
+    result: ClassificationResult | None = None,
 ) -> list[str]:
     """Add labeled wire stubs on each DUT instance terminal.
 
-    Uses label_term() from bridge-lite (auto-computes terminal center
-    + stub direction from instance geometry) executed via batch_ops.
-
-    Label-based wiring: same net name on DUT pin and source pin
-    means Virtuoso auto-connects them.
-
-    All DUT pin labels use the original pin name (e.g., GIOL, GND_DAT).
-    The ground_net field is internal — it tells the program which PVSS
-    to connect source MINUS terminals to, but is never used as a label.
+    For digital_io_output _CORE pins, uses the shared net _DIG_OUT_CORE_NET
+    so that one shared vpulse (placed later) connects to all of them.
+    All other pins keep their original pin name as the net label.
 
     Returns list of net names that were labeled.
     """
+    # Build the set of left-side digital_io_output pin names
+    dig_out_names: set[str] = set()
+    if result:
+        for pc in result.pins:
+            if pc.device_class == "digital_io_output":
+                dig_out_names.add(pc.name)
+
     labeled_nets = []
     cfg = SIDE_CONFIGS
     ops = []
 
     for pin in pins:
-        net_name = pin.name
+        # Right-side _CORE counterpart of a digital output → shared net
+        base = pin.name[:-5] if pin.name.endswith("_CORE") else None
+        if pin.side == "right" and base in dig_out_names:
+            net_name = _DIG_OUT_CORE_NET
+        else:
+            net_name = pin.name
         labeled_nets.append(net_name)
-        ops.append(label_term(
+        ops.append(label_term_directed(
             "DUT", pin.name, net_name,
+            stub_direction=pin.side,
+            extension_length=abs(cfg[pin.side]["extend_x"]),
             rotation=cfg[pin.side]["label_rotation"],
             justification=cfg[pin.side]["label_align"],
         ))
 
     batch_ops(lib, tb_cell, ops)
-    print(f"[step4c] Added {len(labeled_nets)} labeled wire stubs on DUT pins: OK")
+    print(f"[step4c] Added {len(labeled_nets)} wire stubs on DUT pins: OK")
     return labeled_nets
 
 
@@ -579,6 +597,7 @@ def place_sources_and_loads(
     pins: list[PinInfo],
     *,
     classifications: dict[str, PinClassification] | None = None,
+    result: ClassificationResult | None = None,
     dut_xy: tuple[float, float] = (2.5, 0.0),
     vdd_value: float = 1.8,
     client: Optional[VirtuosoClient] = None,
@@ -587,7 +606,7 @@ def place_sources_and_loads(
 
     Dual-side topology:
       Phase 0: Collect ground pins → one PVSS per ground pin
-      Phase 1: Place GND_REF (--GND→gnd! bridge) + PVSS devices
+      Phase 1: Place analogLib/gnd (defines GND net = gnd!) + PVSS devices
       Phase 2: Place outer devices (left side) using AI classification
       Phase 3: Place inner devices (right side) for CORE/duplicate pins
       Phase 4: Set CDF parameters for all instances
@@ -595,7 +614,7 @@ def place_sources_and_loads(
     Label convention:
       - DUT pin labels always use the original pin name (GIOL, GND_DAT, …)
       - PVSS PLUS uses the ground pin name (matches DUT pin for connectivity)
-      - PVSS MINUS and fallback ground use "--GND" (not "gnd!")
+      - PVSS MINUS and all fallback ground connections use "GND" (= gnd! via analogLib/gnd)
       - Source/load MINUS uses the primary ground pin name for the domain
 
     Falls back to PAD_RULES when no LLM classification is available.
@@ -607,226 +626,317 @@ def place_sources_and_loads(
     ops: list[str] = []
     classifications = classifications or {}
 
-    # Build lookups
+    # Convenience lookups
     right_pins = {p.name: p for p in pins if p.side == "right"}
-    left_pins = [p for p in pins if p.side == "left"]
-    has_llm = bool(classifications)
+    left_pins  = [p for p in pins if p.side == "left"]
+    left_by_name = {p.name: p for p in left_pins}
 
-    # ── Phase 0: Collect ground pins and build mappings ──
-    # One PVSS per ground pin — each ground pin gets its own vdc=0 source.
-    ground_pin_pvss: list[str] = []       # ordered list of ground pin names
-    ground_net_primary: dict[str, str] = {}  # ground_net → primary pin name (for source MINUS)
+    # digital_low_gnd: MINUS for digital IO input inner caps and shared output vpulse
+    dig_low_gnd = (result.digital_low_gnd if result else "") or _GND_NET
 
-    if has_llm:
-        for pin in pins:
-            cls = classifications.get(pin.name)
-            if cls and cls.pin_type == "ground" and cls.ground_net:
-                if pin.name not in ground_pin_pvss:
-                    ground_pin_pvss.append(pin.name)
-                gnet = cls.ground_net
-                if gnet not in ground_net_primary:
-                    ground_net_primary[gnet] = pin.name
+    # ── Phase 0: Collect analog ground pins for PVSS placement ──────────────
+    # Only analog_ground (device_class) or legacy pin_type=="ground" without
+    # a digital device_class go through PVSS treatment in Phase 1.
+    # Digital supply grounds (dig_hv_ground, dig_lv_ground) get their own
+    # outer vdc in Phase 2 and are NOT added here.
+    ground_pin_pvss: list[str] = []
+    for pin in left_pins:
+        cls = classifications.get(pin.name)
+        if cls:
+            dc = cls.device_class
+            is_analog_gnd = (
+                dc == "analog_ground" or
+                (dc is None and cls.pin_type == "ground")
+            )
+            if is_analog_gnd and pin.name not in ground_pin_pvss:
+                ground_pin_pvss.append(pin.name)
+        elif classify_pin_heuristic(pin) == "ground":
+            if pin.name not in ground_pin_pvss:
+                ground_pin_pvss.append(pin.name)
 
-    def _resolve_gnet_label(cls_or_none: PinClassification | None) -> str:
-        """Resolve the ground net label for source/load MINUS terminal.
-
-        Uses the primary ground pin name for the domain (e.g., "GIOL" for dgnd,
-        "GND_DAT" for gnd_DAT). Falls back to "--GND" for global ground.
-        """
-        if cls_or_none and cls_or_none.ground_net:
-            return ground_net_primary.get(cls_or_none.ground_net, "--GND")
-        return "--GND"
-
-    # ── Phase 1: Place GND_REF + PVSS devices ──────────
-    min_pin_y = min((p.y for p in pins), default=-5.0)
+    # ── Phase 1: analogLib/gnd + one PVSS per analog ground pin ───────────
+    # All source/load MINUS terminals use "gnd!" directly (Virtuoso global ground).
+    # The analogLib/gnd symbol is placed for visual reference only — it connects
+    # to gnd! internally; no terminal labeling needed.
+    min_pin_y   = min((p.y for p in pins), default=-5.0)
     pvss_base_y = dut_xy[1] + min_pin_y - 4.0
     pvss_x_start = dut_xy[0] - 4.0
     pvss_spacing = 2.5
 
-    # GND_REF: bridges "--GND" local net to "gnd!" global ground
-    gnd_ref_x = pvss_x_start - pvss_spacing
-    gnd_ref_y = pvss_base_y
-    ops.append(create_inst("analogLib", "vdc", "symbol", "GND_REF", gnd_ref_x, gnd_ref_y, "R0"))
-    placed.append("GND_REF")
-    ops.append(label_term("GND_REF", "PLUS", "--GND"))
-    ops.append(label_term("GND_REF", "MINUS", "gnd!"))
+    gnd_sym_x = pvss_x_start - pvss_spacing
+    ops.append(create_inst("analogLib", "gnd", "symbol", "GND_SYM",
+                           gnd_sym_x, pvss_base_y, "R0"))
+    placed.append("GND_SYM")
 
-    # One PVSS per ground pin
     for i, pin_name in enumerate(sorted(ground_pin_pvss)):
         px = pvss_x_start + i * pvss_spacing
-        py = pvss_base_y
-        ops.append(create_inst("analogLib", "vdc", "symbol", pin_name, px, py, "R0"))
-        placed.append(pin_name)
-        ops.append(label_term(pin_name, "PLUS", pin_name))
-        ops.append(label_term(pin_name, "MINUS", "--GND"))
+        pvss_name = f"PVSS_{pin_name}"
+        ops.append(create_inst("analogLib", "vdc", "symbol", pvss_name, px, pvss_base_y, "R0"))
+        placed.append(pvss_name)
+        ops.append(label_term(pvss_name, "PLUS", pin_name))
+        ops.append(label_term(pvss_name, "MINUS", _GND_NET))
 
-    # ── Phase 2: Place outer devices ────────────────────
-    # Only left-side (outer) pins get outer devices on the left
+    # ── Phase 2: Outer devices (left side) ──────────────────────────────────
     for pin in left_pins:
         cls = classifications.get(pin.name)
         px, py = _pin_position_in_tb(pin, dut_xy)
 
         if cls:
-            # Ground and no_connect pins only get labels (from add_wire_labels)
-            if cls.pin_type in ("ground", "no_connect"):
+            dc = cls.device_class
+
+            # analog_ground handled by Phase 1; skip here
+            if dc == "analog_ground" or (dc is None and cls.pin_type in ("ground", "no_connect")):
                 continue
 
-            gnet_label = _resolve_gnet_label(cls)
+            # digital_io_output → outer cap, PLUS=pin, MINUS=GND
+            if dc == "digital_io_output":
+                inst_name = f"LOAD_{pin.name}"
+                sx, sy = _source_load_position(px, py, "left")
+                ops.append(create_inst("analogLib", "cap", "symbol",
+                                       inst_name, sx, sy, "R90"))
+                placed.append(inst_name)
+                ops.append(label_term(inst_name, "PLUS", pin.name))
+                ops.append(label_term(inst_name, "MINUS", _GND_NET))
+                continue
 
             # Outer stimulus
             if cls.stimulus:
                 inst_name = f"SRC_{pin.name}"
                 sx, sy = _source_load_position(px, py, "left")
-                inst_rot = "R90"
                 ops.append(create_inst("analogLib", cls.stimulus, "symbol",
-                                       inst_name, sx, sy, inst_rot))
+                                       inst_name, sx, sy, "R90"))
                 placed.append(inst_name)
-                ops.append(label_term(inst_name, "PLUS", pin.name))
-                ops.append(label_term(inst_name, "MINUS", gnet_label))
+                # analog_current idc is INVERTED: PLUS=GND, MINUS=pin
+                if dc == "analog_current":
+                    ops.append(label_term(inst_name, "PLUS", _GND_NET))
+                    ops.append(label_term(inst_name, "MINUS", pin.name))
+                else:
+                    ops.append(label_term(inst_name, "PLUS", pin.name))
+                    ops.append(label_term(inst_name, "MINUS", _GND_NET))
 
-            # Outer load
+            # Outer load (legacy bidirectional or explicit load field)
             if cls.load:
                 inst_name = f"LOAD_{pin.name}"
                 sx, sy = _source_load_position(px, py, "left", offset=_LOAD_OFFSET)
-                inst_rot = "R90"
                 ops.append(create_inst("analogLib", cls.load, "symbol",
-                                       inst_name, sx, sy, inst_rot))
+                                       inst_name, sx, sy, "R90"))
                 placed.append(inst_name)
                 ops.append(label_term(inst_name, "PLUS", pin.name))
-                ops.append(label_term(inst_name, "MINUS", gnet_label))
+                ops.append(label_term(inst_name, "MINUS", _GND_NET))
 
         else:
-            # Fallback: PAD_RULES
+            # Fallback: PAD_RULES heuristic
             pad_type = classify_pin_heuristic(pin)
             if pad_type == "ground":
                 continue
             rule = PAD_RULES.get(pad_type)
-            if rule is None:
+            if not rule:
                 continue
-
             has_both = "source" in rule and "load" in rule
-
             for role in ("source", "load"):
                 cfg = rule.get(role)
-                if cfg is None:
+                if not cfg:
                     continue
                 inst_name = f"{'SRC' if role == 'source' else 'LOAD'}_{pin.name}"
-                if has_both and role == "load":
-                    sx, sy = _source_load_position(px, py, "left", offset=_LOAD_OFFSET)
-                else:
-                    sx, sy = _source_load_position(px, py, "left")
-                inst_rot = "R90"
+                offset = _LOAD_OFFSET if (has_both and role == "load") else _SRC_LOAD_OFFSET
+                sx, sy = _source_load_position(px, py, "left", offset=offset)
                 ops.append(create_inst(cfg["lib"], cfg["cell"], "symbol",
-                                       inst_name, sx, sy, inst_rot))
+                                       inst_name, sx, sy, "R90"))
                 placed.append(inst_name)
                 ops.append(label_term(inst_name, cfg["term"], pin.name))
-                ops.append(label_term(inst_name, cfg["ref_term"], "--GND"))
+                ops.append(label_term(inst_name, cfg["ref_term"], _GND_NET))
 
-    # ── Phase 3: Place inner devices ────────────────────
-    # Left-side pins with inner_stimulus get inner devices on the right side,
-    # connected to the corresponding CORE/duplicate pin
+    # ── Phase 3: Inner devices ───────────────────────────────────────────────
+    # analog_power   → inner idc, MINUS = PVSS inner pin
+    # analog_current → inner vdc, MINUS = PVSS inner pin
+    # digital_io_input → inner cap (10pF), MINUS = dig_low_gnd
+    # digital_io_output → skipped (shared vpulse in Phase 3b)
+    # all others → no inner device
+
+    def _inner_pin_name(base: str) -> str:
+        """Resolve the inner (right-side) pin name for a given base pin name.
+
+        Priority:
+          1. {base}_CORE exists in right_pins → "{base}_CORE"
+          2. {base} exists in right_pins (duplicate) → "{base}"
+          3. Neither exists → "{base}" (label matches the left-side net; duplicate
+             semantics — both outer/inner on the same net, device still placed)
+        """
+        if f"{base}_CORE" in right_pins:
+            return f"{base}_CORE"
+        return base  # covers both right-side duplicate and no-right-side fallback
+
     for pin in left_pins:
         cls = classifications.get(pin.name)
-        if not cls or not cls.inner_stimulus:
-            continue
+        dc  = cls.device_class if cls else None
 
-        # Find the corresponding right-side (CORE) pin
-        core_pin_name = _find_core_pin_name(pin.name, right_pins)
+        core_pin_name = _inner_pin_name(pin.name)
         core_pin = right_pins.get(core_pin_name)
-
         if core_pin:
             cpx, cpy = _pin_position_in_tb(core_pin, dut_xy)
         else:
-            # Fallback: estimate position on the right side
+            # No right-side pin at all (true duplicate on left only) — place inner
+            # device offset from the left-side pin, pointing rightward
             cpx = dut_xy[0] + abs(pin.x) + 1.5
             cpy = dut_xy[1] + pin.y
-
-        gnet_label = _resolve_gnet_label(cls)
-
-        # Place inner stimulus
-        inst_name = f"INNER_{pin.name}"
         sx, sy = _source_load_position(cpx, cpy, "right")
-        inst_rot = "R90"
 
-        if cls.inner_stimulus == "noConn":
-            # noConn: placed on inner side to prevent LVS warnings
-            ops.append(create_inst("analogLib", "noConn", "symbol",
-                                   inst_name, sx, sy, inst_rot))
+        if cls and dc == "digital_io_input":
+            inst_name = f"INNER_{pin.name}"
+            ops.append(create_inst("analogLib", "cap", "symbol",
+                                   inst_name, sx, sy, "R90"))
             placed.append(inst_name)
             ops.append(label_term(inst_name, "PLUS", core_pin_name))
-        else:
-            # Standard device: vdc, idc, vpulse, cap
+            ops.append(label_term(inst_name, "MINUS", dig_low_gnd))
+
+        elif cls and dc in ("analog_power", "analog_current") and cls.inner_stimulus:
+            # MINUS = inner pin of the local PVSS device
+            pvss_inner = _inner_pin_name(cls.local_pvss) if cls.local_pvss else _GND_NET
+            inst_name = f"INNER_{pin.name}"
             ops.append(create_inst("analogLib", cls.inner_stimulus, "symbol",
-                                   inst_name, sx, sy, inst_rot))
+                                   inst_name, sx, sy, "R90"))
             placed.append(inst_name)
             ops.append(label_term(inst_name, "PLUS", core_pin_name))
-            ops.append(label_term(inst_name, "MINUS", gnet_label))
+            ops.append(label_term(inst_name, "MINUS", pvss_inner))
 
-        # Place inner load (for bidirectional pins)
-        if cls.inner_load:
-            load_inst_name = f"INNER_LOAD_{pin.name}"
-            lx, ly = _source_load_position(cpx, cpy, "right", offset=_LOAD_OFFSET)
-            ops.append(create_inst("analogLib", cls.inner_load, "symbol",
-                                   load_inst_name, lx, ly, inst_rot))
-            placed.append(load_inst_name)
-            ops.append(label_term(load_inst_name, "PLUS", core_pin_name))
-            ops.append(label_term(load_inst_name, "MINUS", gnet_label))
+        elif cls and cls.inner_stimulus and dc not in (
+            "digital_io_output", "analog_ground",
+            "dig_hv_power", "dig_hv_ground", "dig_lv_power", "dig_lv_ground",
+        ):
+            # Legacy / other inner devices
+            gnet = cls.local_pvss or cls.ground_net
+            inner_minus = _inner_pin_name(gnet) if gnet else _GND_NET
+            inst_name = f"INNER_{pin.name}"
+            if cls.inner_stimulus == "noConn":
+                ops.append(create_inst("analogLib", "noConn", "symbol",
+                                       inst_name, sx, sy, "R90"))
+                placed.append(inst_name)
+                ops.append(label_term(inst_name, "PLUS", core_pin_name))
+            else:
+                ops.append(create_inst("analogLib", cls.inner_stimulus, "symbol",
+                                       inst_name, sx, sy, "R90"))
+                placed.append(inst_name)
+                ops.append(label_term(inst_name, "PLUS", core_pin_name))
+                ops.append(label_term(inst_name, "MINUS", inner_minus))
+            if cls.inner_load:
+                load_inst = f"INNER_LOAD_{pin.name}"
+                lx, ly = _source_load_position(cpx, cpy, "right", offset=_LOAD_OFFSET)
+                ops.append(create_inst("analogLib", cls.inner_load, "symbol",
+                                       load_inst, lx, ly, "R90"))
+                placed.append(load_inst)
+                ops.append(label_term(load_inst, "PLUS", core_pin_name))
+                ops.append(label_term(load_inst, "MINUS", inner_minus))
+
+    # ── Phase 3b: Shared digital output vpulse ──────────────────────────────
+    # One vpulse drives ALL digital output _CORE pins via the shared net.
+    dig_out_core_pins = [
+        right_pins[_find_core_pin_name(pin.name, right_pins)]
+        for pin in left_pins
+        if (classifications.get(pin.name) and
+            classifications[pin.name].device_class == "digital_io_output" and
+            _find_core_pin_name(pin.name, right_pins) in right_pins)
+    ]
+    if dig_out_core_pins and result and result.shared_output_vpulse:
+        mid = dig_out_core_pins[len(dig_out_core_pins) // 2]
+        cpx, cpy = _pin_position_in_tb(mid, dut_xy)
+        sx, sy = _source_load_position(cpx, cpy, "right")
+        ops.append(create_inst("analogLib", "vpulse", "symbol",
+                               "INNER_DIG_OUT", sx, sy, "R90"))
+        placed.append("INNER_DIG_OUT")
+        ops.append(label_term("INNER_DIG_OUT", "PLUS", _DIG_OUT_CORE_NET))
+        ops.append(label_term("INNER_DIG_OUT", "MINUS", dig_low_gnd))
+
+    # ── Phase 4: Digital supply current sources ──────────────────────────────
+    # One idc between each (power_pin_net, ground_pin_net) pair.
+    if result and result.digital_supply_pairs:
+        for pair in result.digital_supply_pairs:
+            pwr = pair.get("power", "")
+            gnd = pair.get("ground", "")
+            if not pwr or not gnd:
+                continue
+            pwr_pin = left_by_name.get(pwr)
+            gnd_pin = left_by_name.get(gnd)
+            if pwr_pin and gnd_pin:
+                ppx, ppy = _pin_position_in_tb(pwr_pin, dut_xy)
+                gpx, gpy = _pin_position_in_tb(gnd_pin, dut_xy)
+                idc_x = ppx - _SRC_LOAD_OFFSET * 2.0
+                idc_y = (ppy + gpy) / 2.0
+                inst_name = f"ISUPPLY_{pwr}"
+                ops.append(create_inst("analogLib", "idc", "symbol",
+                                       inst_name, idc_x, idc_y, "R90"))
+                placed.append(inst_name)
+                ops.append(label_term(inst_name, "PLUS", pwr))
+                ops.append(label_term(inst_name, "MINUS", gnd))
 
     batch_ops(lib, tb_cell, ops, timeout=120)
 
-    # ── Phase 4: Set CDF parameters ────────────────────
+    # ── Phase 5: CDF parameters ─────────────────────────────────────────────
+    # PVSS devices (analog ground) — vdc ~0 but not exactly 0 to avoid
+    # schematic warning (zero-voltage source shorted to ground).
+    for pin_name in ground_pin_pvss:
+        _set_cdf_params(lib, tb_cell, f"PVSS_{pin_name}", {"vdc": "0.013"}, vdd_value)
+
     for pin in left_pins:
         cls = classifications.get(pin.name)
-
         if cls:
-            if cls.pin_type in ("ground", "no_connect"):
+            dc = cls.device_class
+            if dc == "analog_ground" or (dc is None and cls.pin_type in ("ground", "no_connect")):
                 continue
-
-            # Outer stimulus params
+            if dc == "digital_io_output":
+                lp = cls.load_params or {"c": "10p"}
+                _set_cdf_params(lib, tb_cell, f"LOAD_{pin.name}", lp, vdd_value)
+                continue
             if cls.stimulus and cls.stimulus_params:
                 _set_cdf_params(lib, tb_cell, f"SRC_{pin.name}",
-                                cls.stimulus_params, vdd_value)
-
-            # Outer load params
+                                cls.stimulus_params, vdd_value, resolve_vdd=True)
             if cls.load and cls.load_params:
                 _set_cdf_params(lib, tb_cell, f"LOAD_{pin.name}",
-                                cls.load_params, vdd_value)
-
-            # Inner stimulus params (skip noConn — no CDF params)
-            if cls.inner_stimulus and cls.inner_params and cls.inner_stimulus != "noConn":
+                                cls.load_params, vdd_value, resolve_vdd=True)
+            if dc == "digital_io_input":
                 _set_cdf_params(lib, tb_cell, f"INNER_{pin.name}",
-                                cls.inner_params, vdd_value)
-
-            # Inner load params
+                                {"c": "10p"}, vdd_value)
+            elif cls.inner_stimulus and cls.inner_params and cls.inner_stimulus != "noConn":
+                _set_cdf_params(lib, tb_cell, f"INNER_{pin.name}",
+                                cls.inner_params, vdd_value, resolve_vdd=True)
             if cls.inner_load and cls.inner_load_params:
                 _set_cdf_params(lib, tb_cell, f"INNER_LOAD_{pin.name}",
-                                cls.inner_load_params, vdd_value)
-
+                                cls.inner_load_params, vdd_value, resolve_vdd=True)
         else:
-            # Fallback: PAD_RULES
             pad_type = classify_pin_heuristic(pin)
             if pad_type == "ground":
                 continue
             rule = PAD_RULES.get(pad_type)
-            if rule is None:
+            if not rule:
                 continue
             for role in ("source", "load"):
                 cfg = rule.get(role)
-                if cfg is None:
-                    continue
-                inst_name = f"{'SRC' if role == 'source' else 'LOAD'}_{pin.name}"
-                params = cfg.get("params", {})
-                if params:
-                    _set_cdf_params(lib, tb_cell, inst_name, params,
-                                    vdd_value, resolve_vdd=True)
+                if cfg and cfg.get("params"):
+                    inst_name = f"{'SRC' if role == 'source' else 'LOAD'}_{pin.name}"
+                    _set_cdf_params(lib, tb_cell, inst_name,
+                                    cfg["params"], vdd_value, resolve_vdd=True)
 
-    # Set GND_REF + PVSS params (vdc=0 for all ground devices)
-    _set_cdf_params(lib, tb_cell, "GND_REF", {"vdc": "0"}, vdd_value)
-    for pin_name in ground_pin_pvss:
-        _set_cdf_params(lib, tb_cell, pin_name, {"vdc": "0"}, vdd_value)
+    if result and result.shared_output_vpulse and "INNER_DIG_OUT" in placed:
+        _set_cdf_params(lib, tb_cell, "INNER_DIG_OUT",
+                        result.shared_output_vpulse, vdd_value, resolve_vdd=True)
 
-    n_pvss = len(ground_pin_pvss) + 1  # +1 for GND_REF
-    n_outer = sum(1 for p in placed if p.startswith(("SRC_", "LOAD_")))
+    if result and result.digital_supply_pairs:
+        for pair in result.digital_supply_pairs:
+            pwr = pair.get("power", "")
+            inst_name = f"ISUPPLY_{pwr}"
+            if pwr and inst_name in placed:
+                _set_cdf_params(lib, tb_cell, inst_name,
+                                {"idc": pair.get("idc", "5m")}, vdd_value)
+
+    # Final check-and-save: setInstParams modifies CDF without calling schCheck,
+    # which causes OSSHNL-109 "modified since last extraction" on netlist generation.
+    rb_exec(
+        f'let((cv) cv = dbOpenCellViewByType("{lib}" "{tb_cell}" "schematic" "schematic" "a") '
+        f'schCheck(cv) dbSave(cv) t)',
+        timeout=30,
+    )
+
+    n_pvss  = len(ground_pin_pvss) + 1
+    n_outer = sum(1 for p in placed if p.startswith(("SRC_", "LOAD_", "ISUPPLY_")))
     n_inner = sum(1 for p in placed if p.startswith("INNER_"))
-    print(f"[step4d] Placed {n_pvss} PVSS + {n_outer} outer + {n_inner} inner instances: OK")
+    print(f"[step4d] Placed {n_pvss} PVSS + {n_outer} outer + {n_inner} inner: OK")
     return placed

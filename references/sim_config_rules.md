@@ -1,22 +1,34 @@
 # IO Ring Simulation Configuration Rules
 
-Rules for generating a Spectre simulation deck for IO Ring testbenches.
-The LLM reads this file plus `pin_info.json` / `pin_classifications.json` and produces `sim_config.json`.
+Rules for generating a simulation deck configuration for IO Ring testbenches.
+The LLM reads this file plus `pin_classifications.json` and produces `sim_config.json`.
+
+**Key principle: the LLM decides WHAT to measure; the code decides HOW to express it
+in Maestro OCEAN syntax.** Never write OCEAN expressions, eval_type, or save_signals
+directly — specify measurement *intent* and let the code template generate correct syntax.
 
 ---
 
 ## Core Rules (Non-Negotiable)
 
-1. **No design variables.** Never emit `design_vars` or `parameters`. All voltage/current values come
-   directly from `pin_classifications.json` stimulus params — they are already fixed numbers.
+1. **No design variables.** Never emit `design_vars` or `parameters`. All voltage/current
+   values come directly from `pin_classifications.json` stimulus params — they are already
+   fixed numbers.
 
 2. **No AC analysis.** IO Ring cells do not need frequency response. Only DC and transient.
 
 3. **Always run both DC and transient.** DC first (sets operating point), transient second.
    This applies to both analog and digital IO cells — no exceptions.
 
-4. **Power is always calculated from transient.** Use `integ(pwr(...), t_start, tstop) / tstop`
-   to get average power per device. Never estimate from DC.
+4. **Power is always calculated from transient.** The code auto-generates the correct
+   OCEAN expression when you specify `measures: ["power"]` for a pin. Never write
+   `integ(pwr(...))` or `pwr()` yourself.
+
+5. **Do not specify model includes.** Leave `model_includes: []`. Phase B injects them
+   automatically from `.env`.
+
+6. **Do not specify save_signals.** The code auto-determines the correct save level
+   (`"all"` when current/power measurements are needed, `"allpub"` otherwise).
 
 ---
 
@@ -24,90 +36,62 @@ The LLM reads this file plus `pin_info.json` / `pin_classifications.json` and pr
 
 ### 1. DC Operating Point
 
-```spectre
-dcOp dc
-```
-
 - **No sweep parameter.** Just an operating point — all sources are at their DC values.
 - Runs first to establish initial conditions for transient.
 - Applied to both analog and digital cells.
 
 ### 2. Transient
 
-```spectre
-tran tran stop=<tstop> errpreset=moderate
-```
-
-- `stop`: should be long enough to see at least 10 full cycles of the slowest `vpulse` stimulus.
-  Compute from stimulus params: `tstop = 10 × max(per)` across all `vpulse` sources.
-  Minimum: `100n`. Maximum: `10u`. Round to a clean value (e.g. `500n`, `1u`).
-- `errpreset=moderate` for digital-dominant cells; `errpreset=conservative` for analog-dominant.
-  A cell is "analog-dominant" if more than half its non-ground pins are `analog_*`, `reference`, or `bias_current` type.
+- `stop`: should be long enough to see at least 10 full cycles of the slowest `vpulse`
+  stimulus. Compute from stimulus params: `tstop = 10 × max(per)` across all `vpulse`
+  sources. Minimum: `100n`. Maximum: `10u`. Round to a clean value (e.g. `500n`, `1u`).
+- `errpreset=moderate` for digital-dominant cells; `errpreset=conservative` for
+  analog-dominant. A cell is "analog-dominant" if more than half its non-ground pins
+  are `analog_*`, `reference`, or `bias_current` type.
 - `maxstep`: set to `tstop / 1000` (Spectre default is often too coarse for IO switching).
 
 ---
 
-## Model Includes
+## Pin Measurements (Core Output)
 
-**Do not specify model includes in `sim_config.json`.** Leave `model_includes: []`.
+Instead of writing OCEAN expressions, specify **measurement intent** per pin.
+The code translates intent into correct Maestro outputs automatically.
 
-Phase B injects the full include list automatically from `.env` after loading your config.
-The generated deck will contain these lines (one `include` per section):
+### What to specify
 
-```spectre
-include "/home/process/tsmc28n/PDK_mmWave/iPDK_CRN28HPC+ULL_v1.8_2p2a_20190531/tsmcN28/../models/spectre/crn28ull_1d8_elk_v1d8_2p2_shrink0d9_embedded_usage.scs" section=pre_simu
-include "..." section=ttmacro_mos_moscap
-include "..." section=tt_res_bip_dio_disres
-include "..." section=tt_mom
-include "..." section=tt_ind_jvar
-include "..." section=tt_r_metal
-include "..." section=noise_worst
-simulator lang=spice
-.include "/home/process/tsmc28n/IO/tphn28hpcpgv18_170a/0971001_20180621/tphn28hpcpgv18_110a_spi/TSMCHOME/digital/Back_End/spice/tphn28hpcpgv18_110a/tphn28hpcpgv18.spi"
-simulator lang=spectre
-```
+For each non-ground pin, list what you want to measure:
 
-All 7 core sections plus the IO pad SPICE model are required for IO Ring. Omitting the IO model
-causes undefined subcircuit errors for pad cells.
+| Measure | What it produces | When to use |
+|---------|-----------------|-------------|
+| `"voltage"` | Voltage net waveform (`add_output` type=net) | All non-ground pins |
+| `"current"` | Average current through SRC_ device | Power supply pins (VDD, VIOH, VIOL) |
+| `"power"` | Average power (V×I) through SRC_ device | Power supply pins (VDD, VIOH, VIOL) |
+| `"custom"` | User-supplied expression (use `custom_expr` field) | Special measurements (gain, BW, etc.) |
 
----
+### Spec constraints
 
-## Save Signals
+Use the `spec` dict to add pass/fail boundaries:
 
-```spectre
-saveOptions options save=allpub
-```
+| Spec key | Meaning | Example |
+|----------|---------|---------|
+| `"i_max"` | Current must be < this value (amps) | `"0.1"` (100 mA) |
+| `"p_max"` | Power must be < this value (watts) | `"0.5"` |
+| `"vmax_above"` | Peak voltage must be > this (supports `*VDD`) | `"0.9*VDD"` |
+| `"vmin_below"` | Minimum voltage must be < this (supports `*VDD`) | `"0.1*VDD"` |
 
-Always use `allpub` for IO Ring. This saves all top-level node voltages and branch currents,
-which are needed for power calculation. Do not use a selective save list — you cannot know in
-advance which internal nodes the power expressions will reference.
+### Important notes
 
----
-
-## Power Calculation (Required Output Expressions)
-
-Power must be computed from transient using the `pwr()` function and `integ()`.
-
-### Per-Device Average Power
-
-For every stimulus/load instance placed in the TB (every `SRC_*`, `LOAD_*`, `INNER_*`, `PVSS` device):
-
-```spectre
-<device_name>_pwr = integ(pwr(<device_name>), 0, <tstop>) / <tstop>
-```
-
-- `pwr(instance_name)` returns the instantaneous power drawn by that instance (watts).
-- `integ(..., 0, tstop) / tstop` gives average power over the simulation window.
-- Name the output `<instance_name>_pwr` (e.g. `SRC_VDD_pwr`, `INNER_D0_pwr`).
-
-### DUT Supply Current (optional, for cross-check)
-
-```spectre
-idd = integ(-i(SRC_VDD:PLUS), 0, <tstop>) / <tstop>
-```
-
-Where `SRC_VDD` is the stimulus instance for the VDD pin. The minus sign accounts for
-Spectre's current direction convention (positive current flows into PLUS terminal).
+- **Only request `"current"` or `"power"` for pins that have an SRC_ device placed.**
+  These are outer-side (left) power pins. Inner/CORE-side pins do not have SRC_ devices
+  — requesting current/power for them will cause OCEAN evaluation errors.
+- **Pins with `measures: []` are explicitly skipped.** Use this for ground, no_connect,
+  reference, and bias_current pins.
+- **Voltage is always added automatically** when any measurement is requested — you do
+  not need to list `"voltage"` separately if you already have `"current"` or `"power"`,
+  but it is clearer to include it explicitly.
+- **Pins not listed in `pin_measurements`** still get voltage net outputs as a debug
+  baseline (unless they are ground/no_connect type).
+- **`*VDD` in spec values** is auto-replaced with the actual VDD value by the code.
 
 ---
 
@@ -117,37 +101,62 @@ Spectre's current direction convention (positive current flows into PLUS termina
 {
   "analyses": [
     {
-      "name": "dcOp",
-      "type": "dc",
+      "name": "dc",
       "enabled": true
     },
     {
       "name": "tran",
-      "type": "tran",
       "enabled": true,
-      "stop": "<computed tstop, e.g. 500n>",
-      "maxstep": "<tstop/1000, e.g. 500p>",
+      "stop": "<computed tstop, e.g. 200n>",
+      "maxstep": "<tstop/1000, e.g. 200p>",
       "errpreset": "moderate"
     }
   ],
   "model_includes": [],
   "save_default": "allpub",
-  "outputs": [
-    {
-      "name": "SRC_VDD_pwr",
-      "expression": "integ(pwr(SRC_VDD), 0, <tstop>) / <tstop>",
-      "eval_type": "wave",
-      "from_analysis": "tran"
+  "pin_measurements": {
+    "VDD": {
+      "measures": ["voltage", "current", "power"],
+      "spec": { "i_max": "0.1" }
+    },
+    "VIOH": {
+      "measures": ["voltage", "current", "power"],
+      "spec": { "i_max": "0.1" }
+    },
+    "VIOL": {
+      "measures": ["voltage", "current", "power"],
+      "spec": { "i_max": "0.1" }
+    },
+    "D0": {
+      "measures": ["voltage"],
+      "spec": { "vmax_above": "0.9*VDD", "vmin_below": "0.1*VDD" }
+    },
+    "SCK": {
+      "measures": ["voltage"],
+      "spec": { "vmax_above": "0.9*VDD", "vmin_below": "0.1*VDD" }
+    },
+    "VADC2": {
+      "measures": ["voltage"]
+    },
+    "OUT": {
+      "measures": ["voltage", "custom"],
+      "custom_expr": "bandwidth(VF(\"/OUT\"), 3, \"low\")",
+      "custom_name": "BW_OUT"
+    },
+    "GND": {
+      "measures": []
     }
-  ]
+  }
 }
 ```
 
 Rules for field values:
-- `model_includes`: leave empty `[]` — the deck builder injects paths from `.env` automatically.
-- `eval_type`: always `"wave"` for power expressions (they are time-domain waveforms from tran).
-- `from_analysis`: always `"tran"` for power expressions; `"dcOp"` for any DC operating-point readout.
-- `outputs`: list every `SRC_*`, `LOAD_*`, `INNER_*` device individually. Skip `GND_REF` and PVSS devices — they are reference sources, not power consumers.
+- `model_includes`: always leave empty `[]` — injected by Phase B.
+- `save_default`: always `"allpub"` — the code auto-upgrades to `"all"` when current/power
+  measurements are detected. Do NOT set `"all"` yourself.
+- `pin_measurements`: list every DUT pin. Use `measures: []` for pins to skip.
+- `custom_expr` / `custom_name`: only when `"custom"` is in measures. The expression
+  uses standard OCEAN syntax (the code handles quote escaping).
 
 ---
 
@@ -162,16 +171,12 @@ Example: if `per` values are `7n`, `10n`, `14n` → `tstop = 10 × 14n = 140n` �
 
 ---
 
-## Simulator Options (Standard)
+## Simulator Options
 
-Always emit these in the deck header:
-
-```spectre
-simulatorOptions options reltol=1e-4 vabstol=1e-6 iabstol=1e-12 gmin=1e-12 temp=27.0 tnom=27.0
+Only override when the user explicitly asks. Defaults are:
 ```
-
-Do not change these unless the user explicitly asks. Do not add `pivrel` — it conflicts with some
-IO pad model formulations.
+reltol=1e-4  vabstol=1e-6  iabstol=1e-12  gmin=1e-12  temp=27.0  tnom=27.0
+```
 
 ---
 
@@ -182,6 +187,8 @@ IO pad model formulations.
 | `design_vars` / `parameters` block | No design variables in IO Ring TB |
 | `ac` analysis | Not applicable to IO Ring |
 | DC sweep (`param=VDD start=0 stop=3`) | No sweep — fixed operating point only |
-| `save VIN VOUT ...` specific signals | Use `allpub` instead |
-| Signal-level output expressions (e.g. gain, bandwidth) | Power only — no signal-processing metrics |
-| `info what=models ...` blocks | Optional, omit unless user asks for model audit |
+| `outputs` array with OCEAN expressions | Use `pin_measurements` instead — code generates expressions |
+| `save_signals` array | Code auto-determines from pin_measurements |
+| `eval_type` / `from_analysis` fields | Handled by code, not LLM |
+| `info_statements` | Standard set injected by code |
+| `save_default: "all"` | Code auto-upgrades; always specify `"allpub"` |

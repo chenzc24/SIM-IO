@@ -40,8 +40,75 @@ from virtuoso_bridge.virtuoso.schematic.ops import (
     schematic_create_pin as create_pin_skill,
     schematic_create_wire as create_wire_skill,
     schematic_create_wire_between_instance_terms as wire_between_terms,
+    _schematic_bind_instance_and_term_expr as _bind_inst_term,
 )
 from virtuoso_bridge.virtuoso.ops import escape_skill_string as _esc
+
+
+# ── Directed label: force stub direction ──────────────────────
+
+_STUB_DIR_OFFSETS = {
+    "left":  (-1.0,  0.0),
+    "right": ( 1.0,  0.0),
+    "up":    ( 0.0,  1.0),
+    "down":  ( 0.0, -1.0),
+}
+
+
+def label_term_directed(
+    instance_name: str,
+    term_name: str,
+    net_name: str,
+    *,
+    stub_direction: str,
+    extension_length: float = 0.75,
+    justification: str = "centerCenter",
+    rotation: str = "R0",
+    style: str = "stick",
+    height: float = 0.0625,
+    cv_expr: str = "cv",
+) -> str:
+    """Place a labeled wire stub with a forced direction.
+
+    Identical to ``label_term`` but bypasses the geometric stub-direction
+    heuristic.  After symbol pin redistribution all pins are on left/right,
+    yet the geometric heuristic routes wires up/down for pins far from the
+    DUT center.  This function forces the stub to extend in the known
+    ``stub_direction`` ("left"/"right"/"up"/"down").
+
+    Inherits the instance/terminal lookup from bridge-lite's
+    ``_schematic_bind_instance_and_term_expr`` and reuses its coordinate
+    transform logic — only the stub-end calculation is replaced.
+    """
+    if stub_direction not in _STUB_DIR_OFFSETS:
+        raise ValueError(
+            f"stub_direction must be one of {sorted(_STUB_DIR_OFFSETS)}, "
+            f"got {stub_direction!r}"
+        )
+    dx, dy = _STUB_DIR_OFFSETS[stub_direction]
+    ext_x = dx * extension_length
+    ext_y = dy * extension_length
+
+    return (
+        "let((rbInst rbTerm rbPin rbFig rbLocalBBox rbLocalCtr rbCtr "
+        "rbStubEnd rbMid) "
+        f"{_bind_inst_term(instance_name, term_name, cv_expr=cv_expr)}"
+        "rbLocalBBox = when(rbFig rbFig~>bBox) "
+        "rbLocalCtr = when(rbLocalBBox "
+        "list((xCoord(car(rbLocalBBox)) + xCoord(cadr(rbLocalBBox))) / 2.0 "
+        "(yCoord(car(rbLocalBBox)) + yCoord(cadr(rbLocalBBox))) / 2.0)) "
+        "rbCtr = when(rbLocalCtr dbTransformPoint(rbLocalCtr rbInst~>transform)) "
+        f"rbStubEnd = when(rbCtr list(xCoord(rbCtr) + {ext_x:g} yCoord(rbCtr) + {ext_y:g})) "
+        "rbMid = when(rbCtr && rbStubEnd "
+        "list((xCoord(rbCtr) + xCoord(rbStubEnd)) / 2.0 "
+        "(yCoord(rbCtr) + yCoord(rbStubEnd)) / 2.0)) "
+        "when(rbCtr && rbStubEnd schCreateWire(cv \"route\" \"full\" list(rbCtr rbStubEnd) 0 0 0 nil nil)) "
+        "when(rbMid "
+        f'schCreateWireLabel({cv_expr} nil rbMid "{_esc(net_name)}" '
+        f'"{_esc(justification)}" '
+        f'"{_esc(rotation)}" '
+        f'"{_esc(style)}" {height:g} nil)))'
+    )
 
 
 # ═══════════════════════════════════════════════════════════════

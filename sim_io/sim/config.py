@@ -89,6 +89,19 @@ class SaveSignal:
 
 
 @dataclass
+class PinMeasurement:
+    """LLM-specified measurement intent for a single pin.
+
+    The LLM decides WHAT to measure; code decides the OCEAN
+    expression syntax, eval_type, and save level.
+    """
+    measures: list[str] = field(default_factory=list)   # ["voltage","current","power","custom"]
+    spec: dict[str, str] = field(default_factory=dict)  # {"i_max":"0.1","vmax_above":"0.9*VDD"}
+    custom_expr: str = ""
+    custom_name: str = ""
+
+
+@dataclass
 class OutputExpression:
     name: str
     expression: str
@@ -124,6 +137,7 @@ class SimDeckConfig:
     analyses: list[AnalysisSpec] = field(default_factory=list)
     save_signals: list[SaveSignal] = field(default_factory=list)
     outputs: list[OutputExpression] = field(default_factory=list)
+    pin_measurements: dict[str, PinMeasurement] = field(default_factory=dict)
     info_statements: list[InfoStatement] = field(default_factory=list)
     sim_options: SimOptions = field(default_factory=SimOptions)
     save_default: str = "allpub"
@@ -277,6 +291,16 @@ def _dict_to_deck_config(data: dict, source: str = "") -> SimDeckConfig:
         for o in data.get("outputs", [])
     ]
 
+    pin_measurements = {}
+    for pin_name, pm_data in data.get("pin_measurements", {}).items():
+        if isinstance(pm_data, dict):
+            pin_measurements[pin_name] = PinMeasurement(
+                measures=pm_data.get("measures", []),
+                spec=pm_data.get("spec", {}),
+                custom_expr=pm_data.get("custom_expr", ""),
+                custom_name=pm_data.get("custom_name", ""),
+            )
+
     info_statements = [
         InfoStatement(
             info_type=i.get("info_type", i.get("type", "")),
@@ -307,6 +331,7 @@ def _dict_to_deck_config(data: dict, source: str = "") -> SimDeckConfig:
         analyses=analyses,
         save_signals=save_signals,
         outputs=outputs,
+        pin_measurements=pin_measurements,
         info_statements=info_statements,
         sim_options=sim_options,
         save_default=data.get("save_default", "allpub"),

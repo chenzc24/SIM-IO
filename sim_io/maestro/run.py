@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
@@ -29,8 +30,9 @@ from virtuoso_bridge.virtuoso.maestro import (
     close_session,
     run_and_wait,
     read_results,
-    export_waveform,
+    create_netlist_for_corner,
 )
+from sim_io.maestro.reader import fix_maestro_results
 
 
 # ── Result Data Structure ──────────────────────────────────────
@@ -102,6 +104,20 @@ def run_maestro_sim(
     print(f"[maestro-sim] Session: {session} (background)")
 
     try:
+        # Step 1b: Pre-create netlist so Maestro won't pop "Update and Run" dialog.
+        # On first run after TB creation, Maestro detects the netlist is stale
+        # and shows a blocking confirmation dialog that hangs the SKILL channel.
+        # Generating the netlist first avoids this.
+        try:
+            print(f"[maestro-sim] Pre-creating netlist to avoid dialog...")
+            netlist_dir = f"/tmp/vb_maestro_netlist_{tname}"
+            create_netlist_for_corner(
+                client, tname, "tt", netlist_dir, session=session
+            )
+            print(f"[maestro-sim] Netlist created: {netlist_dir}")
+        except Exception as e:
+            print(f"[maestro-sim] NOTE: Pre-netlist failed (non-fatal): {e}")
+
         # Step 2: Run simulation + wait for completion
         print(f"[maestro-sim] Starting simulation...")
         history, status = run_and_wait(
@@ -119,10 +135,21 @@ def run_maestro_sim(
 
         # Step 3: Read structured results (per-point × per-output)
         print(f"[maestro-sim] Reading results...")
-        results = read_results(client, session, lib=lib, cell=tb_cell)
+        results = read_results(client, session, lib=lib, cell=tb_cell,
+                               include_raw=True)
+        # Apply 7-col CSV fix if needed (upstream parser doesn't handle
+        # the "Nominal Spec" column in single-run mode).
+        results = fix_maestro_results(results)
         result.overall_spec = results.get("overall_spec")
         result.overall_yield = results.get("overall_yield")
         result.points = results.get("points", [])
+
+        # Save raw CSV to run_dir for debug if available
+        raw_csv = results.get("raw_csv")
+        if raw_csv and run_dir:
+            csv_path = run_dir / "maestro_detail.csv"
+            csv_path.write_text(raw_csv, encoding="utf-8")
+            print(f"[maestro-sim] Raw CSV saved: {csv_path}")
 
         # Detect Spectre failure: Maestro job "done" ≠ Spectre converged.
         # If read_results returns empty points, Spectre likely errored.
@@ -182,6 +209,78 @@ def run_maestro_sim(
     return result
 
 
+def _find_psf_dir(
+    client: VirtuosoClient,
+    session: str,
+    lib: str,
+    cell: str,
+    history: str,
+) -> str:
+    """Locate the psfascii PSF directory for the given Maestro history.
+
+    Tries two strategies in order:
+      1. Construct the canonical path from the library's read path
+         (ddGetObj(lib)~>readPath / cell / maestro/results/maestro / history)
+         then SSH-find the deepest psf/ subdir.
+      2. Fall back to maeOpenResults(?session … ?history …) +
+         asiGetResultsDir(asiGetSession(session)) — used when the lib
+         read path is unavailable.
+    Returns the psf/ directory string, or "" on failure.
+    """
+    tunnel = client._tunnel
+
+    def _ssh_find_psf(base: str) -> str:
+        if tunnel is None:
+            return ""
+        try:
+            r = tunnel.run_command(
+                f'find "{base}" -maxdepth 6 -name "psf" -type d 2>/dev/null | head -1',
+                timeout=15,
+            )
+            return (r.stdout or "").strip()
+        except Exception as e:
+            print(f"[maestro-sim] PSF SSH find failed under {base}: {e}")
+            return ""
+
+    # Strategy 1: canonical lib path
+    r = client.execute_skill(f'ddGetObj("{lib}")~>readPath', timeout=10)
+    lib_path = (r.output or "").strip().strip('"')
+    if lib_path and lib_path.lower() != "nil":
+        base = f"{lib_path}/{cell}/maestro/results/maestro/{history}"
+        psf = _ssh_find_psf(base)
+        if psf:
+            print(f"[maestro-sim] PSF dir (lib path): {psf}")
+            return psf
+
+    # Strategy 2: maeOpenResults + asiGetResultsDir for our specific session
+    try:
+        client.execute_skill(
+            f'maeOpenResults(?session "{session}" ?history "{history}")', timeout=15
+        )
+        r2 = client.execute_skill(
+            f'asiGetResultsDir(asiGetSession("{session}"))', timeout=10
+        )
+        results_dir = (r2.output or "").strip().strip('"')
+        client.execute_skill('maeCloseResults()')
+
+        if results_dir and results_dir.lower() != "nil":
+            # openResults can work directly on the results dir if it IS the psf dir
+            r_open = client.execute_skill(f'openResults("{results_dir}")', timeout=15)
+            if r_open.output and r_open.output.strip() not in ("nil", ""):
+                print(f"[maestro-sim] PSF dir (maeOpenResults direct): {results_dir}")
+                return results_dir
+            # Otherwise find psf/ subdir
+            psf = _ssh_find_psf(results_dir)
+            if psf:
+                print(f"[maestro-sim] PSF dir (maeOpenResults+find): {psf}")
+                return psf
+    except Exception as e:
+        print(f"[maestro-sim] PSF dir via maeOpenResults failed: {e}")
+
+    print(f"[maestro-sim] WARNING: Could not locate PSF dir for {lib}/{cell} history={history}")
+    return ""
+
+
 def _export_waveforms(
     client: VirtuosoClient,
     session: str,
@@ -193,32 +292,56 @@ def _export_waveforms(
     run_dir: Path,
     result: MaestroSimResult,
 ) -> None:
-    """Export waveforms via OCEAN for specified signals."""
+    """Export waveforms via OCEAN for specified signals.
+
+    Bypasses export_waveform() from virtuoso-bridge-lite to avoid two
+    known issues with background sessions:
+      1. execute_skill sends raw SKILL — expressions like v(\"/NET\") are
+         invalid (backslash-escaping only applies inside evalstring).
+         The correct OCEAN syntax is v("/NET") with real double-quotes.
+      2. asiGetCurrentSession() returns the GUI-focused ADE session, not
+         our background session; for automated runs this is typically nil.
+    Instead, we locate the PSF directory directly (lib read path + SSH
+    find) and call OCEAN openResults/selectResults/ocnPrint ourselves.
+    """
     waves_dir = run_dir / "maestro_waves"
     waves_dir.mkdir(parents=True, exist_ok=True)
-    client.execute_skill(f'system("mkdir -p /tmp/vb_sim_waves")', timeout=10)
+
+    psf_dir = _find_psf_dir(client, session, lib, cell, history)
+    if not psf_dir:
+        print(f"[maestro-sim] Waveform export skipped — PSF directory not found")
+        return
+
+    # Open PSF once for all signals
+    r_open = client.execute_skill(f'openResults("{psf_dir}")', timeout=15)
+    if not r_open.output or r_open.output.strip() in ("nil", ""):
+        print(f"[maestro-sim] WARNING: openResults({psf_dir!r}) returned nil — no waveforms")
+        return
+    client.execute_skill(f'selectResults("{analysis}")')
 
     for sig in signals:
         safe_name = re.sub(r"[^A-Za-z0-9_]+", "_", sig).strip("_") or "sig"
-        local_path = str(waves_dir / f"{safe_name}.txt")
+        local_path = waves_dir / f"{safe_name}.txt"
+        nonce = f"{int(time.time() * 1000)}_{safe_name}"
+        remote_path = f"/tmp/vb_wave_{nonce}.txt"
         try:
-            # OCEAN expression: quotes inside SKILL string must be escaped
-            escaped_sig = sig.replace('"', '\\"')
-            export_waveform(
-                client, session,
-                expression=f'v(\\"{escaped_sig}\\")',
-                local_path=local_path,
-                analysis=analysis,
-                history=history,
+            # sig is already in OCEAN path format, e.g. "/SCK" — pass as a
+            # plain quoted string; no backslash-escaping needed here.
+            client.execute_skill(
+                f'ocnPrint(v("{sig}") '
+                f'?numberNotation \'scientific ?numSpaces 1 '
+                f'?output "{remote_path}")',
+                timeout=30,
             )
-            # Verify file actually exists — download_file doesn't raise on SCP failure
-            if Path(local_path).exists() and Path(local_path).stat().st_size > 0:
-                result.waveform_paths.append(local_path)
-                print(f"[maestro-sim] Waveform: {sig} → {local_path}")
+            client.download_file(remote_path, str(local_path))
+            client.execute_skill(f'deleteFile("{remote_path}")')
+            if local_path.exists() and local_path.stat().st_size > 0:
+                result.waveform_paths.append(str(local_path))
+                print(f"[maestro-sim] Waveform: {sig} → {local_path.name}")
             else:
-                print(f"[maestro-sim] WARNING: waveform file empty/missing for {sig}")
+                print(f"[maestro-sim] WARNING: waveform empty/missing for {sig!r}")
         except Exception as e:
-            print(f"[maestro-sim] WARNING: waveform export failed for {sig}: {e}")
+            print(f"[maestro-sim] WARNING: waveform export failed for {sig!r}: {e}")
 
 
 def _print_sim_summary(result: MaestroSimResult) -> None:

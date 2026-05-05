@@ -57,19 +57,31 @@ class PinInfo:
 class PinClassification:
     """Single pin classification result from LLM or heuristic."""
     name: str
-    pin_type: str           # PinType value
+    pin_type: str           # PinType value (legacy; new JSON also sets device_class)
     confidence: float       # 0.0–1.0, LLM self-assessed
     reason: str             # Why this classification was chosen
-    domain: str = ""        # "analog" | "digital" | "digital_hv"
-    stimulus: Optional[str] = None   # Outer stimulus cell: vdc, vpulse, idc
-    stimulus_params: Optional[dict] = None  # Outer stimulus params
-    load: Optional[str] = None       # Outer load cell: cap, res
-    load_params: Optional[dict] = None       # Outer load params
-    inner_stimulus: Optional[str] = None    # Inner (CORE) device: vdc, idc, vpulse, cap, noConn
-    inner_params: Optional[dict] = None     # Inner device params
-    inner_load: Optional[str] = None        # Inner load cell (for bidirectional): cap, res
-    inner_load_params: Optional[dict] = None  # Inner load params
-    ground_net: Optional[str] = None        # Ground domain for internal grouping (e.g. gnd_DAT, dgnd) — NOT used as schematic label
+    domain: str = ""        # "analog" | "digital"
+    # ── New fields (v2 schema) ──────────────────────────────────
+    device_class: Optional[str] = None
+    # One of: analog_power | analog_ground | analog_current |
+    #         dig_hv_power | dig_hv_ground | dig_lv_power | dig_lv_ground |
+    #         digital_io_input | digital_io_output
+    local_pvss: Optional[str] = None
+    # Analog pins only: pin name of the PVSS device that is this pin's local ground.
+    # Code resolves inner MINUS = _find_core_pin_name(local_pvss, right_pins).
+    local_dig_gnd: Optional[str] = None
+    # dig_hv_power / dig_lv_power: name of the paired digital ground pin
+    # (used to place the digital supply current source between the two).
+    # ── Outer / inner device params ─────────────────────────────
+    stimulus: Optional[str] = None        # Outer stimulus cell: vdc, vpulse, idc
+    stimulus_params: Optional[dict] = None
+    load: Optional[str] = None            # Outer load cell: cap
+    load_params: Optional[dict] = None
+    inner_stimulus: Optional[str] = None  # Inner device: idc, vdc, cap — or None
+    inner_params: Optional[dict] = None
+    inner_load: Optional[str] = None
+    inner_load_params: Optional[dict] = None
+    ground_net: Optional[str] = None      # Legacy grouping key; superseded by local_pvss
 
 
 @dataclass
@@ -83,6 +95,18 @@ class ClassificationResult:
     vio_high: float = 1.8
     llm_model: str = ""
     timestamp: str = ""
+    # ── New top-level fields (v2 schema) ────────────────────────
+    digital_low_gnd: str = ""
+    # Name of the dig_lv_ground pin (e.g. "GIOL").
+    # Used as MINUS for digital IO input inner caps and output shared vpulse.
+    analog_local_grounds: list = field(default_factory=list)
+    # [{"pvss_name": "VSSIB", "members": ["VDDIB", "IB3"]}, ...]
+    digital_supply_pairs: list = field(default_factory=list)
+    # [{"power": "PVDD2POC", "ground": "PVSS2DGZ", "idc": "5.3m"}, ...]
+    # Code places one idc between each power/ground outer net pair.
+    shared_output_vpulse: Optional[dict] = None
+    # vpulse params for the single shared inner driver of all digital outputs.
+    # e.g. {"v1":"0","v2":"1.62","per":"7n","tr":"0.1n","tf":"0.1n","pw":"3.5n"}
 
 
 # ── Stimulus/Load Rules ──────────────────────────────────────
@@ -241,30 +265,19 @@ def classify_pin_heuristic(pin: PinInfo) -> str:
 # ── LLM Classification Loader ───────────────────────────────
 
 def load_pin_classifications(path: str | Path) -> ClassificationResult:
-    """Load LLM-generated pin classification JSON.
-
-    Expected schema (see skill scripts/pin_classify_schema.json):
-    {
-      "lib": "...",
-      "cell": "...",
-      "vdd_value": 1.8,
-      "llm_model": "...",
-      "timestamp": "...",
-      "pins": [
-        {"name": "DIN0", "pin_type": "digital_input", "confidence": 0.95,
-         "reason": "...", "stimulus": null, "load": null},
-        ...
-      ]
-    }
-    """
+    """Load LLM-generated pin classification JSON (v1 and v2 schema)."""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     pins = [
         PinClassification(
             name=p["name"],
-            pin_type=p["pin_type"],
+            # v2: prefer device_class as pin_type fallback
+            pin_type=p.get("pin_type") or p.get("device_class", ""),
             confidence=p.get("confidence", 0.0),
             reason=p.get("reason", ""),
             domain=p.get("domain", ""),
+            device_class=p.get("device_class"),
+            local_pvss=p.get("local_pvss"),
+            local_dig_gnd=p.get("local_dig_gnd"),
             stimulus=p.get("stimulus"),
             stimulus_params=p.get("stimulus_params"),
             load=p.get("load"),
@@ -273,7 +286,8 @@ def load_pin_classifications(path: str | Path) -> ClassificationResult:
             inner_params=p.get("inner_params"),
             inner_load=p.get("inner_load"),
             inner_load_params=p.get("inner_load_params"),
-            ground_net=p.get("ground_net"),
+            # local_pvss supersedes ground_net; keep ground_net for v1 compat
+            ground_net=p.get("ground_net") or p.get("local_pvss"),
         )
         for p in data.get("pins", [])
     ]
@@ -286,6 +300,10 @@ def load_pin_classifications(path: str | Path) -> ClassificationResult:
         vio_high=data.get("vio_high", 1.8),
         llm_model=data.get("llm_model", ""),
         timestamp=data.get("timestamp", ""),
+        digital_low_gnd=data.get("digital_low_gnd", ""),
+        analog_local_grounds=data.get("analog_local_grounds", []),
+        digital_supply_pairs=data.get("digital_supply_pairs", []),
+        shared_output_vpulse=data.get("shared_output_vpulse"),
     )
 
 
