@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """TB Builder: create testbench cellview, place DUT, wire labels, place sources/loads.
 
-Steps 4a鈥?d:
+Steps 4a-d:
   4a. Create {primary_cell}_tb schematic cellview
   4b. Place DUT symbol instance
-  4c. Add wire labels (label-based wiring 鈥?no explicit wires drawn)
+  4c. Add wire labels (label-based wiring - no explicit wires drawn)
   4d. Place sources, loads, PVSS, GND_REF; set CDF parameters
 
 Reads pin_classifications.json written by the LLM after symbol_export.
@@ -109,7 +109,7 @@ def run_tb_builder(
             client=client,
         ) if pins else []
     except Exception:
-        print(f"[tb_builder] FAILED 鈥?cleaning up {lib}/{tb_cell}")
+        print(f"[tb_builder] FAILED - cleaning up {lib}/{tb_cell}")
         try:
             _cleanup_tb(client, lib, tb_cell)
         except Exception as cleanup_exc:
@@ -139,14 +139,14 @@ def _resolve_run_dir(explicit: str | None) -> Path:
     latest = _SIM_IO / ".latest_run"
     if not latest.exists():
         raise FileNotFoundError(
-            ".latest_run not found 鈥?run symbol_export first or pass --run-dir"
+            ".latest_run not found - run symbol_export first or pass --run-dir"
         )
     return Path(latest.read_text(encoding="utf-8").strip())
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="SIM-IO TB Builder 鈥?create testbench, place DUT, wire, sources/loads"
+        description="SIM-IO TB Builder - create testbench, place DUT, wire, sources/loads"
     )
     parser.add_argument("--run-dir", metavar="PATH",
                         help="Run directory from symbol_export (default: reads .latest_run)")
@@ -175,7 +175,7 @@ if __name__ == "__main__":
 
     classif_json = run_dir / "pin_classifications.json"
     if not classif_json.exists():
-        print(f"WARNING: {classif_json} not found 鈥?falling back to heuristic classification.",
+        print(f"WARNING: {classif_json} not found - falling back to heuristic classification.",
               file=sys.stderr)
 
     try:

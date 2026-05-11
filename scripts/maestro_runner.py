@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Maestro Runner: Maestro test setup + optional simulation.
 
-Steps 4e鈥?:
+Steps 4e-5:
   4e. Maestro test setup (configures cellview for GUI use too)
    5. Maestro simulation (if --run-sim)
-      鈫?measurements.json, maestro_detail.csv, plots/
+      -> measurements.json, maestro_detail.csv, plots/
 
 Reads pin_classifications.json written by the LLM after symbol_export.
 Falls back to heuristic classification if the file is absent (warning only).
@@ -13,7 +13,7 @@ Usage:
     python scripts/maestro_runner.py                       # Maestro setup only
     python scripts/maestro_runner.py --run-sim             # setup + run simulation
     python scripts/maestro_runner.py --run-dir <path>      # explicit run dir
-    python scripts/maestro_runner.py --intent "DC sweep VDD 0鈫?"
+    python scripts/maestro_runner.py --intent "DC sweep VDD 0->1.8"
 
 Exit codes:
     0  success
@@ -153,7 +153,7 @@ def _resolve_run_dir(explicit: str | None) -> Path:
     latest = _SIM_IO / ".latest_run"
     if not latest.exists():
         raise FileNotFoundError(
-            ".latest_run not found 鈥?run symbol_export first or pass --run-dir"
+            ".latest_run not found - run symbol_export first or pass --run-dir"
         )
     return Path(latest.read_text(encoding="utf-8").strip())
 
@@ -168,7 +168,7 @@ def _load_classifications(run_dir: Path, cell: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="SIM-IO Maestro Runner 鈥?Maestro setup + optional simulation"
+        description="SIM-IO Maestro Runner - Maestro setup + optional simulation"
     )
     parser.add_argument("--run-dir", metavar="PATH",
                         help="Run directory from symbol_export (default: reads .latest_run)")
@@ -192,7 +192,7 @@ if __name__ == "__main__":
 
     classif_json = run_dir / "pin_classifications.json"
     if not classif_json.exists():
-        print(f"WARNING: {classif_json} not found 鈥?falling back to heuristic classification.",
+        print(f"WARNING: {classif_json} not found - falling back to heuristic classification.",
               file=sys.stderr)
 
     try:

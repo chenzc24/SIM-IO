@@ -493,10 +493,15 @@ def run_spectre(
     else:
         print(f"[step3c] Spectre FAILED: {result.errors[:3]}")
 
+    # Bridge may classify "Warning from spectre during circuit read-in" as a
+    # netlist read error even when Spectre exits successfully. SIM-IO treats
+    # result.ok as the source of truth for the public run summary.
+    summary_errors = [] if result.ok else result.errors
+
     result.metadata["summary"] = {
         "status": result.status.value,
         "tool_version": result.tool_version,
-        "errors": result.errors,
+        "errors": summary_errors,
         "warnings": result.warnings[:5],
         "num_signals": len(result.data) if result.data else 0,
     }
