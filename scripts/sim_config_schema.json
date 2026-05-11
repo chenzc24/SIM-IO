@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "SimDeckConfig",
-  "description": "LLM-generated simulation deck configuration — measurement intent, not OCEAN syntax",
+  "description": "LLM-generated simulation deck configuration 鈥?measurement intent, not OCEAN syntax",
   "type": "object",
   "required": ["analyses"],
   "properties": {
@@ -38,7 +38,7 @@
     },
     "model_includes": {
       "type": "array",
-      "description": "PDK model files with sections — leave empty [], injected by Phase B",
+      "description": "PDK model files with sections 鈥?leave empty [], injected by testbench_build",
       "items": {
         "type": "object",
         "required": ["path", "section"],
@@ -133,7 +133,7 @@
     },
     "pin_measurements": {
       "type": "object",
-      "description": "Per-pin measurement intent — the LLM decides WHAT to measure, code decides HOW",
+      "description": "Per-pin measurement intent 鈥?the LLM decides WHAT to measure, code decides HOW",
       "additionalProperties": {
         "type": "object",
         "required": ["measures"],
@@ -182,7 +182,7 @@
     },
     "save_signals": {
       "type": "array",
-      "description": "Specific signals to save — prefer pin_measurements instead",
+      "description": "Specific signals to save 鈥?prefer pin_measurements instead",
       "items": {
         "type": "object",
         "required": ["signal"],
@@ -196,7 +196,7 @@
     },
     "outputs": {
       "type": "array",
-      "description": "Named output expressions — prefer pin_measurements instead",
+      "description": "Named output expressions 鈥?prefer pin_measurements instead",
       "items": {
         "type": "object",
         "required": ["name", "expression"],
@@ -213,14 +213,14 @@
             "type": "string",
             "enum": ["point"],
             "default": "point",
-            "description": "Evaluation type — always 'point' for Maestro"
+            "description": "Evaluation type 鈥?always 'point' for Maestro"
           }
         }
       }
     },
     "info_statements": {
       "type": "array",
-      "description": "Info statements for Spectre output — code injects standard set",
+      "description": "Info statements for Spectre output 鈥?code injects standard set",
       "items": {
         "type": "object",
         "required": ["info_type", "what"],
@@ -258,7 +258,7 @@
       "type": "string",
       "enum": ["allpub", "all", ""],
       "default": "allpub",
-      "description": "Default save mode — always specify 'allpub'; code auto-upgrades to 'all' when needed"
+      "description": "Default save mode 鈥?always specify 'allpub'; code auto-upgrades to 'all' when needed"
     }
   }
 }

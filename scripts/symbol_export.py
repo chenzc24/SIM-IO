@@ -9,7 +9,7 @@ Usage:
 
 Outputs:
     SIM-IO/output/<timestamp>/pin_info.json
-    SIM-IO/output/<timestamp>/phase_a_result.json
+    SIM-IO/output/<timestamp>/dut_context.json
     SIM-IO/.latest_run   (absolute path to the run directory)
 
 Exit codes:
@@ -30,7 +30,7 @@ _SIM_IO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_SIM_IO))
 
 from sim_io.flow import (
-    PhaseAResult,
+    DutContext,
     SimFlowResult,
     SKILL_DIR,
     create_run_dir,
@@ -49,7 +49,7 @@ def run_symbol_export(
     vdd_value: float = 1.8,
     debug: bool = False,
     client: VirtuosoClient | None = None,
-) -> PhaseAResult:
+) -> DutContext:
     """Symbol export + redistribution + pin extraction.
 
     Steps:
@@ -107,7 +107,7 @@ def run_symbol_export(
     # Write pin_info.json — symbol export ends here
     write_pin_info_json(pins, lib, primary_cell, vdd_value, run_dir / "pin_info.json")
 
-    result = PhaseAResult(
+    result = DutContext(
         lib=lib,
         primary_cell=primary_cell,
         pins=pins,
@@ -129,10 +129,6 @@ def run_symbol_export(
     print(f"{'='*60}\n")
 
     return result
-
-
-# Backward compat alias
-run_phase_a = run_symbol_export
 
 
 if __name__ == "__main__":

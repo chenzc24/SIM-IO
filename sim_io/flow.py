@@ -1,13 +1,14 @@
 """
-sim_io.flow — Building blocks for the SIM-IO pipeline.
+sim_io.flow 鈥?Building blocks for the SIM-IO pipeline.
 
 Step functions and dataclasses used by scripts/symbol_export.py, tb_builder.py, and maestro_runner.py.
-Do not call run_symbol_export / run_tb_builder / run_maestro_runner from here — those live in the scripts.
+Do not call run_symbol_export / run_tb_builder / run_maestro_runner from here 鈥?those live in the scripts.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from dataclasses import dataclass, asdict
@@ -51,7 +52,7 @@ _OUTPUT_ROOT = _SIM_IO / "output"
 # Shared net label used to connect all digital output _CORE pins to one vpulse.
 _DIG_OUT_CORE_NET = "DIG_OUT_CORE"
 
-# Global ground net — all source/load MINUS terminals label "gnd!" directly.
+# Global ground net 鈥?all source/load MINUS terminals label "gnd!" directly.
 # In Virtuoso "gnd!" is a built-in global net; no analogLib/gnd symbol needed.
 _GND_NET = "gnd!"
 
@@ -60,19 +61,19 @@ def load_llm_result(run_dir: Path, *, cell: str = "") -> ClassificationResult | 
     """Load pin_classifications.json, returning the full ClassificationResult or None."""
     run_path = run_dir / "pin_classifications.json"
     if not run_path.exists():
-        print(f"[llm] No pin_classifications.json in {run_dir} — heuristic fallback.")
+        print(f"[llm] No pin_classifications.json in {run_dir} 鈥?heuristic fallback.")
         return None
     result = load_pin_classifications(run_path)
     if cell and result.cell and result.cell != cell:
         print(f"[llm] WARNING: {run_path} has cell={result.cell!r}, "
-              f"expected {cell!r} — skipping stale file")
+              f"expected {cell!r} 鈥?skipping stale file")
         return None
     print(f"[llm] Loaded {len(result.pins)} pin classifications from {run_path}")
     return result
 
 
 def load_llm_classifications(run_dir: Path, *, cell: str = "") -> dict[str, PinClassification]:
-    """Backward-compat wrapper — returns name→PinClassification dict."""
+    """Backward-compat wrapper 鈥?returns name鈫扨inClassification dict."""
     r = load_llm_result(run_dir, cell=cell)
     if r:
         return build_classification_map(r)
@@ -106,12 +107,12 @@ def create_run_dir() -> Path:
 
 
 def log_skill_code(run_dir: Path, skill_path: str | Path) -> None:
-    """Copy a skill file into ``run_dir/skill_code/`` for logging."""
+    """Copy a skill file into ``run_dir/build/skill_code/`` for logging."""
     src = Path(skill_path)
     if not src.is_file():
         return
-    dest_dir = run_dir / "skill_code"
-    dest_dir.mkdir(exist_ok=True)
+    dest_dir = run_dir / "build" / "skill_code"
+    dest_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dest_dir / src.name)
 
 
@@ -146,15 +147,15 @@ class SimFlowResult:
 
 
 @dataclass
-class PhaseAResult:
-    """Result of Phase A: symbol export + redistribution + pin extraction.
+class DutContext:
+    """Result of symbol export: symbol generation, redistribution, and pin extraction.
 
-    Phase A ends after writing ``pin_info.json`` so the LLM can classify pins.
-    Pass this to ``run_tb_builder()`` / ``run_maestro_runner()`` after writing ``pin_classifications.json``
+    Symbol export ends after writing ``pin_info.json`` so pin intent can be authored.
+    Pass this to later workflow steps after writing ``pin_classifications.json``
     to the run directory.
 
-    ``tb_cell`` is always ``f"{primary_cell}_tb"`` — TB creation happens in
-    Phase B, not Phase A.
+    ``tb_cell`` is always ``f"{primary_cell}_tb"`` 鈥?TB creation happens in
+    the testbench build step.
     """
     lib: str
     primary_cell: str
@@ -169,16 +170,17 @@ class PhaseAResult:
         return f"{self.primary_cell}_tb"
 
     def save(self, run_dir: Path) -> None:
-        """Serialize to run_dir/phase_a_result.json for cross-process use."""
+        """Serialize to run_dir/dut_context.json for cross-process use."""
         data = asdict(self)
         data["run_dir"] = str(run_dir)
-        (run_dir / "phase_a_result.json").write_text(
-            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        text = json.dumps(data, indent=2, ensure_ascii=False)
+        (run_dir / "dut_context.json").write_text(text, encoding="utf-8")
+        if os.getenv("SIM_IO_WRITE_LEGACY_PHASE_A") == "1":
+            (run_dir / "phase_a_result.json").write_text(text, encoding="utf-8")
 
     @classmethod
-    def load(cls, path: str | Path) -> PhaseAResult:
-        """Load from a phase_a_result.json file."""
+    def load(cls, path: str | Path) -> DutContext:
+        """Load from a DUT context checkpoint file."""
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         data.pop("tb_cell", None)  # compat: tb_cell is now a property
         data["run_dir"] = Path(data["run_dir"])
@@ -186,7 +188,30 @@ class PhaseAResult:
         return cls(**data)
 
 
-# ── Step 1: Export Symbol ───────────────────────────────────
+# Backward-compatible type alias for older callers.
+PhaseAResult = DutContext
+
+
+def dut_context_path(run_dir: Path) -> Path:
+    """Return the preferred DUT context path for a run directory."""
+    return run_dir / "dut_context.json"
+
+
+def load_dut_context(run_dir: Path) -> DutContext:
+    """Load DUT context, accepting the legacy checkpoint name as fallback."""
+    preferred = run_dir / "dut_context.json"
+    if preferred.exists():
+        return DutContext.load(preferred)
+    legacy = run_dir / "phase_a_result.json"
+    if legacy.exists():
+        return DutContext.load(legacy)
+    raise FileNotFoundError(
+        f"DUT context not found in {run_dir} "
+        "(expected dut_context.json; legacy phase_a_result.json also accepted)"
+    )
+
+
+# 鈹€鈹€ Step 1: Export Symbol 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 def export_symbol(client: VirtuosoClient, lib: str, cell: str) -> bool:
     """Generate symbol view from schematic via TSG pipeline.
@@ -222,11 +247,11 @@ def export_symbol(client: VirtuosoClient, lib: str, cell: str) -> bool:
                    context="export_symbol_verify", fail_ok=True)
     views = re.findall(r'"([^"]+)"', r.output)
     ok = "symbol" in views
-    print(f"[step1] Symbol export: {'OK' if ok else 'FAILED'} — views: {views}")
+    print(f"[step1] Symbol export: {'OK' if ok else 'FAILED'} 鈥?views: {views}")
     return ok
 
 
-# ── Step 2: Redistribute Symbol Pins ────────────────────────────
+# 鈹€鈹€ Step 2: Redistribute Symbol Pins 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 def redistribute_symbol(
     client: VirtuosoClient,
@@ -247,8 +272,10 @@ def redistribute_symbol(
     Returns True if redistribution succeeded.
     """
     print(f"[step2] Redistributing symbol pins for {lib}/{cell}")
+    build_dir = run_dir / "build"
+    build_dir.mkdir(parents=True, exist_ok=True)
 
-    # 2a: Fresh TSG — delete old symbol and regenerate
+    # 2a: Fresh TSG 鈥?delete old symbol and regenerate
     skill_exec(client, f'ddDeleteCellView("{lib}" "{cell}" "symbol")',
                context="redistribute_delete_symbol", fail_ok=True)
     skill_exec(client, 'schSetEnv("ssgSortPins" "geometric")',
@@ -281,7 +308,7 @@ def redistribute_symbol(
           f"{len(info.labels)} labels, {len(info.terminals)} terminals")
 
     # Save raw extraction data
-    (run_dir / "extract_raw.txt").write_text(r.output or "", encoding="utf-8")
+    (build_dir / "extract_raw.txt").write_text(r.output or "", encoding="utf-8")
 
     # 2c: Calculate layout
     engine = LayoutEngine(LayoutConfig())
@@ -299,13 +326,13 @@ def redistribute_symbol(
             "pins": [{k: (v.value if isinstance(v, Side) else v)
                       for k, v in asdict(p).items()} for p in result.pins],
         }
-        (run_dir / "layout_result.json").write_text(
+        (build_dir / "layout_result.json").write_text(
             json.dumps(layout_data, indent=2), encoding="utf-8"
         )
 
     # 2d: Apply layout
     skill_code = generate_apply_skill(lib, cell, result, engine.config)
-    apply_il = run_dir / "apply_layout.il"
+    apply_il = build_dir / "apply_layout.il"
     apply_il.write_text(skill_code, encoding="utf-8")
 
     load_r = client.load_il(str(apply_il), timeout=120)
@@ -324,7 +351,7 @@ def redistribute_symbol(
     return True
 
 
-# ── Symbol Editing Ops ────────────────────────────────────────
+# 鈹€鈹€ Symbol Editing Ops 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 def symbol_move_pin(
@@ -359,7 +386,7 @@ def symbol_move_pin(
     return ok
 
 
-# ── Step 3: Create TB Cellview ──────────────────────────────
+# 鈹€鈹€ Step 3: Create TB Cellview 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 def create_tb_cellview(client: VirtuosoClient, lib: str, primary_cell: str) -> str:
     """Create a new schematic cellview named {primary_cell}_tb.
@@ -368,7 +395,7 @@ def create_tb_cellview(client: VirtuosoClient, lib: str, primary_cell: str) -> s
     """
     tb_cell = f"{primary_cell}_tb"
 
-    # Create fresh (mode "w") — overwrites if exists
+    # Create fresh (mode "w") 鈥?overwrites if exists
     r = skill_exec(
         client,
         f'dbOpenCellViewByType("{lib}" "{tb_cell}" "schematic" "schematic" "w")',
@@ -376,7 +403,7 @@ def create_tb_cellview(client: VirtuosoClient, lib: str, primary_cell: str) -> s
     )
     if not r.output or r.output.strip().lower() == "nil":
         raise RuntimeError(
-            f"Failed to create {lib}/{tb_cell}/schematic — "
+            f"Failed to create {lib}/{tb_cell}/schematic 鈥?"
             "cellview may be open in GUI (close it first)"
         )
 
@@ -390,7 +417,7 @@ def create_tb_cellview(client: VirtuosoClient, lib: str, primary_cell: str) -> s
     return tb_cell
 
 
-# ── Step 4a: Place DUT Instance ─────────────────────────────
+# 鈹€鈹€ Step 4a: Place DUT Instance 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 def place_dut(client: VirtuosoClient, lib: str, tb_cell: str, primary_cell: str) -> bool:
     """Place the primary cell's symbol as DUT instance in _tb schematic."""
@@ -400,7 +427,7 @@ def place_dut(client: VirtuosoClient, lib: str, tb_cell: str, primary_cell: str)
     return True
 
 
-# ── Step 4b: Extract DUT Pin Info ───────────────────────────
+# 鈹€鈹€ Step 4b: Extract DUT Pin Info 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 def extract_dut_pins(client: VirtuosoClient, lib: str, primary_cell: str) -> list[PinInfo]:
     """Extract all pin info from the symbol view of the primary cell.
@@ -467,7 +494,7 @@ def extract_dut_pins(client: VirtuosoClient, lib: str, primary_cell: str) -> lis
     return pins
 
 
-# ── Step 4c: Add Wire + Label (label-based wiring) ──────────
+# 鈹€鈹€ Step 4c: Add Wire + Label (label-based wiring) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 
 def add_wire_labels(
@@ -498,7 +525,7 @@ def add_wire_labels(
     ops = []
 
     for pin in pins:
-        # Right-side _CORE counterpart of a digital output → shared net
+        # Right-side _CORE counterpart of a digital output 鈫?shared net
         base = pin.name[:-5] if pin.name.endswith("_CORE") else None
         if pin.side == "right" and base in dig_out_names:
             net_name = _DIG_OUT_CORE_NET
@@ -518,7 +545,7 @@ def add_wire_labels(
     return labeled_nets
 
 
-# ── Step 4d: Place Sources & Loads ───────────────────────────
+# 鈹€鈹€ Step 4d: Place Sources & Loads 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 def _pin_position_in_tb(
     pin: PinInfo, dut_xy: tuple[float, float]
@@ -545,8 +572,8 @@ def _resolve_param_value(value: str, vdd_value: float) -> str:
     """Replace VDD placeholder with the actual voltage value.
 
     Handles:
-      "VDD" → str(vdd_value)
-      "VDD/2" → computed division
+      "VDD" 鈫?str(vdd_value)
+      "VDD/2" 鈫?computed division
     Other values are returned as-is.
     """
     if "VDD" not in value:
@@ -621,14 +648,14 @@ def place_sources_and_loads(
     """Place sources, loads, PVSS devices, and inner devices based on pin classification.
 
     Dual-side topology:
-      Phase 0: Collect ground pins → one PVSS per ground pin
+      Phase 0: Collect ground pins 鈫?one PVSS per ground pin
       Phase 1: Place analogLib/gnd (defines GND net = gnd!) + PVSS devices
       Phase 2: Place outer devices (left side) using AI classification
       Phase 3: Place inner devices (right side) for CORE/duplicate pins
       Phase 4: Set CDF parameters for all instances
 
     Label convention:
-      - DUT pin labels always use the original pin name (GIOL, GND_DAT, …)
+      - DUT pin labels always use the original pin name (GIOL, GND_DAT, 鈥?
       - PVSS PLUS uses the ground pin name (matches DUT pin for connectivity)
       - PVSS MINUS and all fallback ground connections use "GND" (= gnd! via analogLib/gnd)
       - Source/load MINUS uses the primary ground pin name for the domain
@@ -650,7 +677,7 @@ def place_sources_and_loads(
     # digital_low_gnd: MINUS for digital IO input inner caps and shared output vpulse
     dig_low_gnd = (result.digital_low_gnd if result else "") or _GND_NET
 
-    # ── Phase 0: Collect analog ground pins for PVSS placement ──────────────
+    # 鈹€鈹€ Phase 0: Collect analog ground pins for PVSS placement 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     # Only analog_ground (device_class) or legacy pin_type=="ground" without
     # a digital device_class go through PVSS treatment in Phase 1.
     # Digital supply grounds (dig_hv_ground, dig_lv_ground) get their own
@@ -670,9 +697,9 @@ def place_sources_and_loads(
             if pin.name not in ground_pin_pvss:
                 ground_pin_pvss.append(pin.name)
 
-    # ── Phase 1: analogLib/gnd + one PVSS per analog ground pin ───────────
+    # 鈹€鈹€ Phase 1: analogLib/gnd + one PVSS per analog ground pin 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     # All source/load MINUS terminals use "gnd!" directly (Virtuoso global ground).
-    # The analogLib/gnd symbol is placed for visual reference only — it connects
+    # The analogLib/gnd symbol is placed for visual reference only 鈥?it connects
     # to gnd! internally; no terminal labeling needed.
     min_pin_y   = min((p.y for p in pins), default=-5.0)
     pvss_base_y = dut_xy[1] + min_pin_y - 4.0
@@ -692,7 +719,7 @@ def place_sources_and_loads(
         ops.append(label_term(pvss_name, "PLUS", pin_name))
         ops.append(label_term(pvss_name, "MINUS", _GND_NET))
 
-    # ── Phase 2: Outer devices (left side) ──────────────────────────────────
+    # 鈹€鈹€ Phase 2: Outer devices (left side) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     for pin in left_pins:
         cls = classifications.get(pin.name)
         px, py = _pin_position_in_tb(pin, dut_xy)
@@ -704,7 +731,7 @@ def place_sources_and_loads(
             if dc == "analog_ground" or (dc is None and cls.pin_type in ("ground", "no_connect")):
                 continue
 
-            # digital_io_output → outer cap, PLUS=pin, MINUS=GND
+            # digital_io_output 鈫?outer cap, PLUS=pin, MINUS=GND
             if dc == "digital_io_output":
                 inst_name = f"LOAD_{pin.name}"
                 sx, sy = _source_load_position(px, py, "left")
@@ -762,21 +789,21 @@ def place_sources_and_loads(
                 ops.append(label_term(inst_name, cfg["term"], pin.name))
                 ops.append(label_term(inst_name, cfg["ref_term"], _GND_NET))
 
-    # ── Phase 3: Inner devices ───────────────────────────────────────────────
-    # analog_power   → inner idc, MINUS = PVSS inner pin
-    # analog_current → inner vdc, MINUS = PVSS inner pin
-    # digital_io_input → inner cap (10pF), MINUS = dig_low_gnd
-    # digital_io_output → skipped (shared vpulse in Phase 3b)
-    # all others → no inner device
+    # 鈹€鈹€ Phase 3: Inner devices 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # analog_power   鈫?inner idc, MINUS = PVSS inner pin
+    # analog_current 鈫?inner vdc, MINUS = PVSS inner pin
+    # digital_io_input 鈫?inner cap (10pF), MINUS = dig_low_gnd
+    # digital_io_output 鈫?skipped (shared vpulse in Phase 3b)
+    # all others 鈫?no inner device
 
     def _inner_pin_name(base: str) -> str:
         """Resolve the inner (right-side) pin name for a given base pin name.
 
         Priority:
-          1. {base}_CORE exists in right_pins → "{base}_CORE"
-          2. {base} exists in right_pins (duplicate) → "{base}"
-          3. Neither exists → "{base}" (label matches the left-side net; duplicate
-             semantics — both outer/inner on the same net, device still placed)
+          1. {base}_CORE exists in right_pins 鈫?"{base}_CORE"
+          2. {base} exists in right_pins (duplicate) 鈫?"{base}"
+          3. Neither exists 鈫?"{base}" (label matches the left-side net; duplicate
+             semantics 鈥?both outer/inner on the same net, device still placed)
         """
         if f"{base}_CORE" in right_pins:
             return f"{base}_CORE"
@@ -791,7 +818,7 @@ def place_sources_and_loads(
         if core_pin:
             cpx, cpy = _pin_position_in_tb(core_pin, dut_xy)
         else:
-            # No right-side pin at all (true duplicate on left only) — place inner
+            # No right-side pin at all (true duplicate on left only) 鈥?place inner
             # device offset from the left-side pin, pointing rightward
             cpx = dut_xy[0] + abs(pin.x) + 1.5
             cpy = dut_xy[1] + pin.y
@@ -843,7 +870,7 @@ def place_sources_and_loads(
                 ops.append(label_term(load_inst, "PLUS", core_pin_name))
                 ops.append(label_term(load_inst, "MINUS", inner_minus))
 
-    # ── Phase 3b: Shared digital output vpulse ──────────────────────────────
+    # 鈹€鈹€ Phase 3b: Shared digital output vpulse 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     # One vpulse drives ALL digital output _CORE pins via the shared net.
     dig_out_core_pins = [
         right_pins[_find_core_pin_name(pin.name, right_pins)]
@@ -862,7 +889,7 @@ def place_sources_and_loads(
         ops.append(label_term("INNER_DIG_OUT", "PLUS", _DIG_OUT_CORE_NET))
         ops.append(label_term("INNER_DIG_OUT", "MINUS", dig_low_gnd))
 
-    # ── Phase 4: Digital supply current sources ──────────────────────────────
+    # 鈹€鈹€ Phase 4: Digital supply current sources 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
     # One idc between each (power_pin_net, ground_pin_net) pair.
     if result and result.digital_supply_pairs:
         for pair in result.digital_supply_pairs:
@@ -886,8 +913,8 @@ def place_sources_and_loads(
 
     batch_ops(client, lib, tb_cell, ops, timeout=120)
 
-    # ── Phase 5: CDF parameters ─────────────────────────────────────────────
-    # PVSS devices (analog ground) — vdc ~0 but not exactly 0 to avoid
+    # 鈹€鈹€ Phase 5: CDF parameters 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # PVSS devices (analog ground) 鈥?vdc ~0 but not exactly 0 to avoid
     # schematic warning (zero-voltage source shorted to ground).
     for pin_name in ground_pin_pvss:
         _set_cdf_params(lib, tb_cell, f"PVSS_{pin_name}", {"vdc": "0.013"}, vdd_value, client=client)

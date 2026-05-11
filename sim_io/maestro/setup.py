@@ -100,6 +100,22 @@ _DIGITAL_PIN_TYPES = frozenset({
 })
 
 _SKIP_PIN_TYPES = frozenset({"ground", "no_connect", "reference", "bias_current"})
+_DIG_OUT_CORE_NET = "DIG_OUT_CORE"
+
+
+def _measurement_net_name(
+    pin_name: str,
+    pins: list[PinInfo],
+    classifications: dict[str, "PinClassification"] | None = None,
+) -> str:
+    pin_by_name = {p.name: p for p in pins or []}
+    pin = pin_by_name.get(pin_name)
+    if pin and pin.side == "right" and pin_name.endswith("_CORE"):
+        base = pin_name[:-5]
+        cls = classifications.get(base) if classifications else None
+        if cls and cls.pin_type == "digital_output":
+            return _DIG_OUT_CORE_NET
+    return pin_name
 
 
 def _auto_generate_outputs(
@@ -251,7 +267,8 @@ def _build_outputs_from_measurements(
         if not pm.measures:
             continue
 
-        sig_path = f"/{pin_name}"
+        net_name = _measurement_net_name(pin_name, pins, classifications)
+        sig_path = f"/{net_name}"
 
         # 1. Voltage net — always added when any measurement is requested
         add_output(client, pin_name, tname,
@@ -263,22 +280,22 @@ def _build_outputs_from_measurements(
         #    measurement.  Spec boundaries are optional — without them the
         #    scalar is still useful for measurements.json and verify.
         if "voltage" in pm.measures:
-            vmax_name = f"vmax_{pin_name}"
-            vmax_expr = _escape_ocean_expr(f'ymax(v("{sig_path}" ?result "tran"))')
-            add_output(client, vmax_name, tname,
-                       output_type="point", expr=vmax_expr,
-                       session=session)
             if "vmax_above" in pm.spec:
+                vmax_name = f"vmax_{pin_name}"
+                vmax_expr = _escape_ocean_expr(f'ymax(v("{sig_path}" ?result "tran"))')
+                add_output(client, vmax_name, tname,
+                           output_type="point", expr=vmax_expr,
+                           session=session)
                 threshold = pm.spec["vmax_above"].replace("VDD", str(vdd_value))
                 set_spec(client, vmax_name, tname,
                          gt=threshold, session=session)
 
-            vmin_name = f"vmin_{pin_name}"
-            vmin_expr = _escape_ocean_expr(f'ymin(v("{sig_path}" ?result "tran"))')
-            add_output(client, vmin_name, tname,
-                       output_type="point", expr=vmin_expr,
-                       session=session)
             if "vmin_below" in pm.spec:
+                vmin_name = f"vmin_{pin_name}"
+                vmin_expr = _escape_ocean_expr(f'ymin(v("{sig_path}" ?result "tran"))')
+                add_output(client, vmin_name, tname,
+                           output_type="point", expr=vmin_expr,
+                           session=session)
                 threshold = pm.spec["vmin_below"].replace("VDD", str(vdd_value))
                 set_spec(client, vmin_name, tname,
                          lt=threshold, session=session)

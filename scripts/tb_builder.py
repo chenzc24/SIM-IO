@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """TB Builder: create testbench cellview, place DUT, wire labels, place sources/loads.
 
-Steps 4a–4d:
+Steps 4a鈥?d:
   4a. Create {primary_cell}_tb schematic cellview
   4b. Place DUT symbol instance
-  4c. Add wire labels (label-based wiring — no explicit wires drawn)
+  4c. Add wire labels (label-based wiring 鈥?no explicit wires drawn)
   4d. Place sources, loads, PVSS, GND_REF; set CDF parameters
 
 Reads pin_classifications.json written by the LLM after symbol_export.
@@ -33,8 +33,9 @@ _SIM_IO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_SIM_IO))
 
 from sim_io.flow import (
-    PhaseAResult,
+    DutContext,
     SimFlowResult,
+    load_dut_context,
     load_llm_result,
     classify_pin,
     create_tb_cellview,
@@ -59,7 +60,7 @@ def _cleanup_tb(client: VirtuosoClient, lib: str, tb_cell: str) -> None:
 
 
 def run_tb_builder(
-    phase_a: PhaseAResult,
+    dut_context: DutContext,
     *,
     client: VirtuosoClient | None = None,
 ) -> tuple[list[str], list[str], dict[str, PinClassification], ClassificationResult | None]:
@@ -72,15 +73,15 @@ def run_tb_builder(
     if client is None:
         client = VirtuosoClient.from_env()
 
-    lib = phase_a.lib
-    primary_cell = phase_a.primary_cell
-    tb_cell = phase_a.tb_cell
-    pins = phase_a.pins
-    vdd_value = phase_a.vdd_value
+    lib = dut_context.lib
+    primary_cell = dut_context.primary_cell
+    tb_cell = dut_context.tb_cell
+    pins = dut_context.pins
+    vdd_value = dut_context.vdd_value
 
     # Load LLM classifications from run_dir/pin_classifications.json
     classif_result: ClassificationResult | None = load_llm_result(
-        phase_a.run_dir, cell=primary_cell
+        dut_context.run_dir, cell=primary_cell
     )
     from sim_io.pin_types import build_classification_map
     classifications = build_classification_map(classif_result) if classif_result else {}
@@ -108,7 +109,7 @@ def run_tb_builder(
             client=client,
         ) if pins else []
     except Exception:
-        print(f"[tb_builder] FAILED — cleaning up {lib}/{tb_cell}")
+        print(f"[tb_builder] FAILED 鈥?cleaning up {lib}/{tb_cell}")
         try:
             _cleanup_tb(client, lib, tb_cell)
         except Exception as cleanup_exc:
@@ -126,14 +127,10 @@ def run_tb_builder(
         t = classify_pin(p, classifications)
         types[t] = types.get(t, 0) + 1
     print(f"  Pin types:         {dict(sorted(types.items()))}")
-    print(f"  Next: python scripts/maestro_runner.py [--run-sim]")
+    print(f"  Next: python scripts/spectre_runner.py")
     print(f"{'='*60}\n")
 
     return labels, sources, classifications, classif_result
-
-
-# Backward compat alias
-run_phase_b1 = run_tb_builder
 
 
 def _resolve_run_dir(explicit: str | None) -> Path:
@@ -142,14 +139,14 @@ def _resolve_run_dir(explicit: str | None) -> Path:
     latest = _SIM_IO / ".latest_run"
     if not latest.exists():
         raise FileNotFoundError(
-            ".latest_run not found — run symbol_export first or pass --run-dir"
+            ".latest_run not found 鈥?run symbol_export first or pass --run-dir"
         )
     return Path(latest.read_text(encoding="utf-8").strip())
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="SIM-IO TB Builder — create testbench, place DUT, wire, sources/loads"
+        description="SIM-IO TB Builder 鈥?create testbench, place DUT, wire, sources/loads"
     )
     parser.add_argument("--run-dir", metavar="PATH",
                         help="Run directory from symbol_export (default: reads .latest_run)")
@@ -163,27 +160,26 @@ if __name__ == "__main__":
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    phase_a_json = run_dir / "phase_a_result.json"
-    if not phase_a_json.exists():
-        print(f"ERROR: {phase_a_json} not found — run symbol_export first.", file=sys.stderr)
+    try:
+        dut_context = load_dut_context(run_dir)
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}; run symbol_export first.", file=sys.stderr)
         sys.exit(1)
 
     # --cleanup: delete _tb cellview and exit
     if args.cleanup:
-        phase_a = PhaseAResult.load(phase_a_json)
         client = VirtuosoClient.from_env()
-        _cleanup_tb(client, phase_a.lib, phase_a.tb_cell)
+        _cleanup_tb(client, dut_context.lib, dut_context.tb_cell)
         print("Cleanup done.")
         sys.exit(0)
 
     classif_json = run_dir / "pin_classifications.json"
     if not classif_json.exists():
-        print(f"WARNING: {classif_json} not found — falling back to heuristic classification.",
+        print(f"WARNING: {classif_json} not found 鈥?falling back to heuristic classification.",
               file=sys.stderr)
 
     try:
-        phase_a = PhaseAResult.load(phase_a_json)
-        run_tb_builder(phase_a)
+        run_tb_builder(dut_context)
         print(f"\nTB builder complete.")
         sys.exit(0)
     except Exception as exc:

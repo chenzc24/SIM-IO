@@ -29,8 +29,9 @@ from sim_io.sim.config import (
     resolve_sim_config, SPECTRE_BIN, SPECTRE_LICENSE,
 )
 from sim_io.site_config import SiteConfig
-from sim_io.pin_types import PinInfo, classify_pin_heuristic
+from sim_io.pin_types import PinInfo, classify_pin_heuristic, load_pin_classifications
 
+_SIM_IO = Path(__file__).resolve().parents[2]
 _OUTPUT_ROOT = _SIM_IO / "output"
 
 # Remote directory for si batch netlist export
@@ -38,6 +39,27 @@ _SI_REMOTE_DIR = "/tmp/sim_io_si_run"
 
 # si.env template path
 _SI_ENV_TEMPLATE = _SIM_IO / "templates" / "si_spectre.env"
+
+
+def _spectre_run_dir(run_dir: Path) -> Path:
+    path = run_dir / "spectre"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _resolve_psf_dir(run_dir: Path, deck_path: Path) -> Path:
+    candidates = [
+        deck_path.parent / f"{deck_path.stem}.raw",
+        run_dir / f"{deck_path.stem}.raw",
+    ]
+    for psf_dir in candidates:
+        if not psf_dir.exists():
+            nested = psf_dir / psf_dir.name
+            if nested.exists():
+                return nested
+            continue
+        return psf_dir
+    return candidates[0]
 
 
 # ── Template Helpers ────────────────────────────────────────────
@@ -377,7 +399,8 @@ def export_netlist(
             print(f"[step3a] WARNING: si returned errors: {r.errors}")
 
     # 5. Download netlist
-    local_netlist = run_dir / "netlist.scs"
+    spectre_dir = _spectre_run_dir(run_dir)
+    local_netlist = spectre_dir / "netlist.scs"
     r = client.download_file(f"{_SI_REMOTE_DIR}/netlist", str(local_netlist))
     if not r.ok:
         # Try alternate output location
@@ -405,7 +428,8 @@ def build_deck(
     Returns the path to the complete deck file.
     """
     deck_text = build_sim_deck_from_file(netlist_path, config)
-    deck_path = run_dir / "deck.scs"
+    spectre_dir = _spectre_run_dir(run_dir)
+    deck_path = spectre_dir / "deck.scs"
     deck_path.write_text(deck_text, encoding="utf-8")
     print(f"[step3b] Deck built: {deck_path}")
     return deck_path
@@ -457,7 +481,7 @@ def run_spectre(
         spectre_cmd=spectre_cmd,
         spectre_args=spectre_mode_args(mode),
         timeout=timeout,
-        work_dir=run_dir,
+        work_dir=deck_path.parent,
         output_format="psfascii",
     )
 
@@ -469,17 +493,13 @@ def run_spectre(
     else:
         print(f"[step3c] Spectre FAILED: {result.errors[:3]}")
 
-    # Save result metadata
-    result_meta = {
+    result.metadata["summary"] = {
         "status": result.status.value,
         "tool_version": result.tool_version,
         "errors": result.errors,
         "warnings": result.warnings[:5],
         "num_signals": len(result.data) if result.data else 0,
     }
-    (run_dir / "spectre_result.json").write_text(
-        json.dumps(result_meta, indent=2), encoding="utf-8"
-    )
 
     return result
 
@@ -632,22 +652,57 @@ def _measure_power(data: dict, v_signal: str, i_signal: str) -> dict:
     }
 
 
+def _normal_signal_name(name: str) -> str:
+    return name.strip().lstrip("/").replace("/", ".")
+
+
 def _find_signal(data: dict, name: str, dut_instance: str = "DUT") -> str | None:
     """Find a signal in PSF data by trying multiple naming conventions."""
+    if not name:
+        return None
     candidates = [
         f"{dut_instance}.{name}",
         name,
         f"/{dut_instance}/{name}",
         f"{dut_instance}/{name}",
+        f"dc_{name}",
+        f"dc_{dut_instance}.{name}",
+        f"dc_{dut_instance}/{name}",
     ]
     for c in candidates:
         if c in data:
             return c
-    # Fuzzy match
+
+    target = _normal_signal_name(name)
     for key in data:
-        if key.endswith(f".{name}") or key.endswith(f"/{name}"):
+        norm = _normal_signal_name(key.removeprefix("dc_"))
+        if norm == target or norm.endswith(f".{target}"):
             return key
     return None
+
+
+def _extract_dut_pin_net_map(deck_path: Path, dut_instance: str = "DUT") -> dict[str, str]:
+    """Map subckt pin names to top-level TB net names for the DUT instance."""
+    if not deck_path or not deck_path.exists():
+        return {}
+    text = deck_path.read_text(encoding="utf-8", errors="replace")
+
+    subckt_match = re.search(r"^\s*subckt\s+(\S+)\s+(.+?)^\s*ends\s+\1\b",
+                             text, flags=re.MULTILINE | re.DOTALL)
+    if not subckt_match:
+        return {}
+    cell_name = subckt_match.group(1)
+    subckt_pins = re.sub(r"\\\s*\n\s*", " ", subckt_match.group(2)).split()
+
+    inst_match = re.search(
+        rf"^\s*{re.escape(dut_instance)}\s*\((.*?)\)\s+{re.escape(cell_name)}\b",
+        text,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if not inst_match:
+        return {}
+    inst_nets = re.sub(r"\\\s*\n\s*", " ", inst_match.group(1)).split()
+    return dict(zip(subckt_pins, inst_nets))
 
 
 def _detect_analysis_type(data: dict) -> str:
@@ -666,6 +721,9 @@ def parse_results(
     pins: list[PinInfo],
     dut_instance: str = "DUT",
     vdd_value: float = 1.8,
+    deck_config: Optional[SimDeckConfig] = None,
+    net_aliases: Optional[dict[str, str]] = None,
+    classifications: Optional[dict[str, object]] = None,
 ) -> dict:
     """Extract measurements from Spectre results, organized by pin.
 
@@ -678,15 +736,33 @@ def parse_results(
     data = result.data
     analysis = _detect_analysis_type(data)
     pin_measurements = {}
+    configured = deck_config.pin_measurements if deck_config is not None else {}
+    pins_by_name = {p.name: p for p in pins}
+    requested_names = list(configured.keys()) if configured else [p.name for p in pins]
+    requested_measured_total = 0
+    net_aliases = net_aliases or {}
 
-    for pin in pins:
-        pad_type = classify_pin_heuristic(pin)
+    for pin_name in requested_names:
+        pin = pins_by_name.get(pin_name, PinInfo(pin_name, "", 0.0, 0.0, ""))
+        pm = configured.get(pin_name) if configured else None
+        measures = set(pm.measures if pm is not None else ["voltage"])
+        if not measures:
+            continue
+        requested_measured_total += 1
+
+        if classifications and pin.name in classifications:
+            pad_type = getattr(classifications[pin.name], "pin_type", classify_pin_heuristic(pin))
+        else:
+            pad_type = classify_pin_heuristic(pin)
         if pad_type == "ground":
             continue
 
-        signal_key = _find_signal(data, pin.name, dut_instance)
+        net_name = net_aliases.get(pin.name, pin.name)
+        signal_key = _find_signal(data, net_name, dut_instance)
+        if signal_key is None and net_name != pin.name:
+            signal_key = _find_signal(data, pin.name, dut_instance)
 
-        if signal_key and signal_key in data:
+        if "voltage" in measures and signal_key and signal_key in data:
             if analysis == "tran":
                 metrics = _measure_tran(data, signal_key)
             elif analysis == "dc":
@@ -696,9 +772,9 @@ def parse_results(
 
             metrics["pad_type"] = pad_type
             metrics["psf_key"] = signal_key
+            metrics["net"] = net_name
 
-            # Power pin: add current + power measurements
-            if pad_type == "power":
+            if "current" in measures or "power" in measures:
                 src_name = f"SRC_{pin.name}"
                 # Spectre PSF uses various formats for branch currents
                 i_candidates = [
@@ -714,7 +790,7 @@ def parse_results(
                         break
 
                 if i_key and i_key in data:
-                    if analysis == "tran":
+                    if "current" in measures and analysis == "tran":
                         i_vals = data.get(i_key, [])
                         try:
                             import numpy as np
@@ -725,14 +801,18 @@ def parse_results(
                         except (ImportError, ValueError):
                             pass
 
-                    power = _measure_power(data, signal_key, i_key)
-                    if "error" not in power:
-                        metrics.update(power)
+                    if "power" in measures:
+                        power = _measure_power(data, signal_key, i_key)
+                        if "error" not in power:
+                            metrics.update(power)
+                elif "current" in measures or "power" in measures:
+                    metrics["current_error"] = "current signal not found in PSF data"
 
             pin_measurements[pin.name] = metrics
         else:
             pin_measurements[pin.name] = {
                 "pad_type": pad_type,
+                "net": net_name,
                 "error": "signal not found in PSF data",
             }
 
@@ -742,7 +822,7 @@ def parse_results(
         "num_pins_measured": sum(
             1 for m in pin_measurements.values() if "error" not in m
         ),
-        "num_pins_total": len(pins),
+        "num_pins_total": requested_measured_total,
         "pins": pin_measurements,
     }
 
@@ -756,7 +836,9 @@ class SimRunResult:
     netlist_path: Optional[str]
     deck_path: Optional[str]
     spectre_ok: bool
-    measurements: dict
+    spectre: dict = field(default_factory=dict)
+    measurements_path: Optional[str] = None
+    measurements_summary: dict = field(default_factory=dict)
     plot_paths: list[str] = field(default_factory=list)
     run_dir: Optional[str] = None
 
@@ -863,21 +945,19 @@ def run_sim_run(
             )
             print(f"[step3b] Added IO model include: {site.pdk_io_spectre_include}")
 
-    # Add current save signals for power pins so standalone Spectre deck
-    # includes branch currents (needed for power measurements).
+    # Add current save signals for requested current/power measurements so
+    # standalone Spectre deck includes branch currents.
     if resolved_config is not None and isinstance(resolved_config, SimDeckConfig):
         from sim_io.sim.config import SaveSignal
-        for pin in pins:
-            pad_type = classify_pin_heuristic(pin)
-            if pad_type == "power":
-                src_name = f"SRC_{pin.name}"
+        for pin_name, pm in resolved_config.pin_measurements.items():
+            if "current" in pm.measures or "power" in pm.measures:
+                src_name = f"SRC_{pin_name}"
                 resolved_config.save_signals.append(
                     SaveSignal(signal=f"{src_name}:p")
                 )
         if resolved_config.save_signals:
-            # Ensure save_default includes currents when power pins exist
             if resolved_config.save_default == "allpub":
-                resolved_config.save_default = "allpub save=current"
+                resolved_config.save_default = "all"
 
     # Step 3b: Build deck
     deck_path = None
@@ -903,7 +983,21 @@ def run_sim_run(
     measurements = {}
     plot_paths = []
     if sim_result is not None and sim_result.ok:
-        measurements = parse_results(sim_result, pins, vdd_value=vdd_value)
+        net_aliases = _extract_dut_pin_net_map(deck_path, "DUT") if deck_path else {}
+        classifications = None
+        pin_class_path = run_dir / "pin_classifications.json"
+        if pin_class_path.exists():
+            try:
+                class_result = load_pin_classifications(pin_class_path)
+                classifications = {pc.name: pc for pc in class_result.pins}
+            except Exception as e:
+                print(f"[step3d] WARNING: Failed to load pin classifications: {e}")
+        measurements = parse_results(
+            sim_result, pins, vdd_value=vdd_value,
+            deck_config=resolved_config if isinstance(resolved_config, SimDeckConfig) else None,
+            net_aliases=net_aliases,
+            classifications=classifications,
+        )
         # Save measurements
         (run_dir / "measurements.json").write_text(
             json.dumps(measurements, indent=2, default=str), encoding="utf-8"
@@ -913,40 +1007,45 @@ def run_sim_run(
         try:
             from sim_io.sim.viz import visualize_run, parse_psf_ascii, extract_dc_metrics, extract_ac_metrics
 
-            psf_dir = run_dir / f"{deck_path.stem}.raw"
-            if not psf_dir.exists():
-                # Try nested .raw/.raw
-                nested = psf_dir / psf_dir.name
-                if nested.exists():
-                    psf_dir = nested
+            psf_dir = _resolve_psf_dir(run_dir, deck_path)
 
             if psf_dir.exists():
                 plots_dir = run_dir / "plots"
-                plot_paths = visualize_run(str(psf_dir), str(plots_dir))
+                plot_signals: list[str] = []
+                plot_labels: dict[str, str] = {}
+                for pin_name, pin_metrics in (measurements.get("pins") or {}).items():
+                    if "error" in pin_metrics:
+                        continue
+                    psf_key = pin_metrics.get("psf_key")
+                    if not psf_key:
+                        continue
+                    if psf_key not in plot_signals:
+                        plot_signals.append(psf_key)
+                    # Preserve user-facing pin names in plots even when the
+                    # Spectre-visible TB net must be renamed for simulation.
+                    plot_labels.setdefault(psf_key, pin_name)
 
-                # Extract key metrics from viz parser
-                viz_metrics = {}
-                for psf_file in psf_dir.glob("*.dc"):
-                    try:
-                        dc = parse_psf_ascii(str(psf_file))
-                        viz_metrics["dc"] = extract_dc_metrics(dc)
-                    except Exception:
-                        pass
-                    break
-                for psf_file in psf_dir.glob("*.ac"):
-                    try:
-                        ac = parse_psf_ascii(str(psf_file))
-                        viz_metrics["ac"] = extract_ac_metrics(ac)
-                    except Exception:
-                        pass
-                    break
-                if viz_metrics:
-                    (run_dir / "viz_metrics.json").write_text(
-                        json.dumps(viz_metrics, indent=2), encoding="utf-8"
-                    )
-                    print(f"[step3e] Metrics: {viz_metrics}")
+                plot_paths = visualize_run(
+                    str(psf_dir),
+                    str(plots_dir),
+                    signals=plot_signals or None,
+                    labels=plot_labels or None,
+                )
+
+                # Plots are the persistent visualization artifact. Older runs
+                # wrote viz_metrics.json here, but it was often empty for this
+                # IO-ring DC/tran route and duplicated measurement extraction.
         except Exception as e:
             print(f"[step3e] Visualization skipped: {e}")
+
+    measurements_summary = {}
+    if measurements:
+        measurements_summary = {
+            "status": measurements.get("status", ""),
+            "analysis": measurements.get("analysis", ""),
+            "num_pins_measured": measurements.get("num_pins_measured", 0),
+            "num_pins_total": measurements.get("num_pins_total", 0),
+        }
 
     result = SimRunResult(
         lib=lib,
@@ -954,7 +1053,9 @@ def run_sim_run(
         netlist_path=str(netlist_path) if netlist_path else None,
         deck_path=str(deck_path) if deck_path else None,
         spectre_ok=spectre_ok,
-        measurements=measurements,
+        spectre=(sim_result.metadata.get("summary", {}) if sim_result is not None else {}),
+        measurements_path=str(run_dir / "measurements.json") if measurements else None,
+        measurements_summary=measurements_summary,
         plot_paths=[str(p) for p in plot_paths],
     )
     result.save(run_dir)

@@ -36,6 +36,8 @@ _SKILL_DIR = _SIM_IO / "skill_code"
 def run(lib: str, cell: str, *, debug: bool = False):
     client = VirtuosoClient.from_env()
     run_dir = create_run_dir()
+    build_dir = run_dir / "build"
+    build_dir.mkdir(parents=True, exist_ok=True)
 
     # Log current skill code snapshot
     for il_file in sorted(_SKILL_DIR.glob("*.il")):
@@ -73,7 +75,7 @@ def run(lib: str, cell: str, *, debug: bool = False):
           f"{len(info.labels)} labels, {len(info.terminals)} terminals")
 
     # Save raw extraction data
-    (run_dir / "extract_raw.txt").write_text(r.output or "", encoding="utf-8")
+    (build_dir / "extract_raw.txt").write_text(r.output or "", encoding="utf-8")
 
     # ── Step 2: Calculate layout ──────────────────────────────
     print("\n=== Step 2: Calculate layout ===")
@@ -96,7 +98,7 @@ def run(lib: str, cell: str, *, debug: bool = False):
             "pins": [{k: (v.value if isinstance(v, Side) else v)
                       for k, v in asdict(p).items()} for p in result.pins],
         }
-        (run_dir / "layout_result.json").write_text(
+        (build_dir / "layout_result.json").write_text(
             json.dumps(layout_data, indent=2), encoding="utf-8"
         )
 
@@ -105,7 +107,7 @@ def run(lib: str, cell: str, *, debug: bool = False):
     skill_code = generate_apply_skill(lib, cell, result, engine.config)
 
     # Save generated .il to run_dir
-    apply_il = run_dir / "apply_layout.il"
+    apply_il = build_dir / "apply_layout.il"
     apply_il.write_text(skill_code, encoding="utf-8")
     print(f"  Saved: {apply_il}")
 

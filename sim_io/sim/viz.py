@@ -68,9 +68,13 @@ def _parse_dc_psf(text: str) -> DCSweepData:
     if m:
         sweep_var = m.group(1)
 
-    # Extract trace names from TRACE section
+    # Extract trace names from TRACE section. Spectre can write GROUP
+    # aliases and then use those aliases in VALUE, so map aliases back
+    # to human-readable signal names.
     trace_names = []
+    value_name_map = {}
     in_trace = False
+    pending_group = None
     for line in text.splitlines():
         line = line.strip()
         if line == "TRACE":
@@ -80,9 +84,18 @@ def _parse_dc_psf(text: str) -> DCSweepData:
             in_trace = False
             continue
         if in_trace:
+            m_group = re.match(r'^"([^"]+)"\s+GROUP\b', line)
+            if m_group:
+                pending_group = m_group.group(1)
+                continue
             m = re.match(r'^"(\w[^"]*)"\s+"(\w+)"', line)
             if m:
-                trace_names.append(m.group(1))
+                name = m.group(1)
+                trace_names.append(name)
+                value_name_map[name] = name
+                if pending_group is not None:
+                    value_name_map[pending_group] = name
+                    pending_group = None
 
     # Each data block has (1 sweep_var + N traces) entries, where N = len(trace_names)
     # But the sweep_var also appears as a trace signal, so the block size in VALUE
@@ -108,7 +121,7 @@ def _parse_dc_psf(text: str) -> DCSweepData:
         # Scalar: "name" value
         m = re.match(r'^"(\w[^"]*)"\s+([\d.eE+\-]+)$', line)
         if m:
-            name, val = m.group(1), float(m.group(2))
+            name, val = value_name_map.get(m.group(1), m.group(1)), float(m.group(2))
 
             if entry_idx == 0:
                 # First entry in each block is always the sweep value
@@ -160,6 +173,17 @@ def _parse_ac_psf(text: str) -> ACSweepData:
 def _parse_tran_psf(text: str) -> TranData:
     data = TranData()
     in_value = False
+    value_name_map = _trace_value_name_map(text)
+    trace_names = [name for alias, name in value_name_map.items() if alias == name and name != "time"]
+    current: dict[str, float] = {}
+    pending_time: float | None = None
+
+    def flush_sample() -> None:
+        if pending_time is None:
+            return
+        data.time.append(pending_time)
+        for sig in trace_names:
+            data.signals.setdefault(sig, []).append(current.get(sig, math.nan))
 
     for line in text.splitlines():
         line = line.strip()
@@ -171,17 +195,47 @@ def _parse_tran_psf(text: str) -> TranData:
         if not in_value:
             continue
 
-        m = re.match(r'^"(\w+)"\s+([\d.eE+\-]+)$', line)
+        m = re.match(r'^"([^"]+)"\s+([\d.eE+\-]+)$', line)
         if m:
-            name, val = m.group(1), float(m.group(2))
+            name, val = value_name_map.get(m.group(1), m.group(1)), float(m.group(2))
             if name == "time":
-                data.time.append(val)
+                flush_sample()
+                pending_time = val
             else:
-                if name not in data.signals:
-                    data.signals[name] = []
-                data.signals[name].append(val)
+                current[name] = val
+
+    flush_sample()
 
     return data
+
+
+def _trace_value_name_map(text: str) -> dict[str, str]:
+    value_name_map: dict[str, str] = {}
+    in_trace = False
+    pending_group = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line == "TRACE":
+            in_trace = True
+            continue
+        if line in ("VALUE", "SWEEP", "HEADER", "TYPE", "END"):
+            if in_trace:
+                break
+            continue
+        if not in_trace:
+            continue
+        m_group = re.match(r'^"([^"]+)"\s+GROUP\b', line)
+        if m_group:
+            pending_group = m_group.group(1)
+            continue
+        m = re.match(r'^"([^"]+)"\s+"[^"]+"', line)
+        if m:
+            name = m.group(1)
+            value_name_map[name] = name
+            if pending_group is not None:
+                value_name_map[pending_group] = name
+                pending_group = None
+    return value_name_map
 
 
 # ── Plot Generation ───────────────────────────────────────────────
@@ -190,6 +244,7 @@ def plot_dc_sweep(
     dc: DCSweepData,
     output_path: str | Path,
     signals: Optional[list[str]] = None,
+    labels: Optional[dict[str, str]] = None,
     title: str = "DC Sweep",
 ) -> Path:
     """Plot DC sweep results as SVG."""
@@ -204,12 +259,13 @@ def plot_dc_sweep(
     fig, ax = plt.subplots(figsize=(8, 5))
     for sig in sigs:
         if sig in dc.signals:
-            ax.plot(dc.sweep_values, dc.signals[sig], label=sig, linewidth=1.5)
+            ax.plot(dc.sweep_values, dc.signals[sig], label=(labels or {}).get(sig, sig), linewidth=1.5)
 
     ax.set_xlabel(f"{dc.sweep_var} (V)")
     ax.set_ylabel("Voltage (V)")
     ax.set_title(title)
-    ax.legend()
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend()
     ax.grid(True, alpha=0.3)
 
     out = Path(output_path)
@@ -222,6 +278,7 @@ def plot_ac_bode(
     ac: ACSweepData,
     output_path: str | Path,
     signals: Optional[list[str]] = None,
+    labels: Optional[dict[str, str]] = None,
     title: str = "AC Analysis — Bode Plot",
 ) -> Path:
     """Plot AC Bode plot (magnitude + phase) as SVG."""
@@ -247,12 +304,14 @@ def plot_ac_bode(
         mag = np.abs(vals)
         phase = np.degrees(np.angle(vals))
 
-        ax_mag.semilogx(freq, 20 * np.log10(mag + 1e-30), label=sig, linewidth=1.5)
-        ax_phase.semilogx(freq, phase, label=sig, linewidth=1.5)
+        label = (labels or {}).get(sig, sig)
+        ax_mag.semilogx(freq, 20 * np.log10(mag + 1e-30), label=label, linewidth=1.5)
+        ax_phase.semilogx(freq, phase, label=label, linewidth=1.5)
 
     ax_mag.set_ylabel("Magnitude (dB)")
     ax_mag.set_title(title)
-    ax_mag.legend()
+    if ax_mag.get_legend_handles_labels()[0]:
+        ax_mag.legend()
     ax_mag.grid(True, alpha=0.3, which="both")
 
     ax_phase.set_xlabel("Frequency (Hz)")
@@ -269,6 +328,7 @@ def plot_tran(
     tran: TranData,
     output_path: str | Path,
     signals: Optional[list[str]] = None,
+    labels: Optional[dict[str, str]] = None,
     title: str = "Transient Analysis",
 ) -> Path:
     """Plot transient waveforms as SVG."""
@@ -307,11 +367,12 @@ def plot_tran(
         fig, ax = plt.subplots(figsize=(10, max(4, n_sigs * 0.8)))
         for sig in sigs:
             if sig in tran.signals:
-                ax.plot(tran.time, tran.signals[sig], label=sig, linewidth=1.2)
+                ax.plot(tran.time, tran.signals[sig], label=(labels or {}).get(sig, sig), linewidth=1.2)
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Voltage (V)")
         ax.set_title(title)
-        ax.legend(fontsize=8)
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
     else:
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 3 * n_rows), squeeze=False)
@@ -319,8 +380,9 @@ def plot_tran(
             row, col = idx // n_cols, idx % n_cols
             ax = axes[row][col]
             if sig in tran.signals:
-                ax.plot(tran.time, tran.signals[sig], label=sig, linewidth=1.0)
-                ax.set_title(sig, fontsize=9)
+                label = (labels or {}).get(sig, sig)
+                ax.plot(tran.time, tran.signals[sig], label=label, linewidth=1.0)
+                ax.set_title(label, fontsize=9)
                 ax.set_ylabel("V", fontsize=8)
                 ax.grid(True, alpha=0.3)
                 ax.tick_params(labelsize=7)
@@ -340,6 +402,7 @@ def visualize_run(
     psf_dir: str | Path,
     output_dir: Optional[str | Path] = None,
     signals: Optional[list[str]] = None,
+    labels: Optional[dict[str, str]] = None,
 ) -> list[Path]:
     """Auto-detect and plot all PSF results in a directory.
 
@@ -368,17 +431,17 @@ def visualize_run(
 
         if isinstance(data, DCSweepData):
             out = output_dir / f"{name}_dc_sweep.svg"
-            plot_dc_sweep(data, out, signals=signals, title=f"DC Sweep — {name}")
+            plot_dc_sweep(data, out, signals=signals, labels=labels, title=f"DC Sweep — {name}")
             plots.append(out)
             print(f"[viz] DC sweep plot: {out}")
         elif isinstance(data, ACSweepData):
             out = output_dir / f"{name}_bode.svg"
-            plot_ac_bode(data, out, signals=signals, title=f"AC Bode — {name}")
+            plot_ac_bode(data, out, signals=signals, labels=labels, title=f"AC Bode — {name}")
             plots.append(out)
             print(f"[viz] AC Bode plot: {out}")
         elif isinstance(data, TranData):
             out = output_dir / f"{name}_tran.svg"
-            plot_tran(data, out, signals=signals, title=f"Transient — {name}")
+            plot_tran(data, out, signals=signals, labels=labels, title=f"Transient — {name}")
             plots.append(out)
             print(f"[viz] Transient plot: {out}")
 

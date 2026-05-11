@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Maestro Runner: Maestro test setup + optional simulation.
 
-Steps 4e–5:
+Steps 4e鈥?:
   4e. Maestro test setup (configures cellview for GUI use too)
    5. Maestro simulation (if --run-sim)
-      → measurements.json, maestro_detail.csv, plots/
+      鈫?measurements.json, maestro_detail.csv, plots/
 
 Reads pin_classifications.json written by the LLM after symbol_export.
 Falls back to heuristic classification if the file is absent (warning only).
@@ -13,7 +13,7 @@ Usage:
     python scripts/maestro_runner.py                       # Maestro setup only
     python scripts/maestro_runner.py --run-sim             # setup + run simulation
     python scripts/maestro_runner.py --run-dir <path>      # explicit run dir
-    python scripts/maestro_runner.py --intent "DC sweep VDD 0→3"
+    python scripts/maestro_runner.py --intent "DC sweep VDD 0鈫?"
 
 Exit codes:
     0  success
@@ -33,7 +33,8 @@ _SIM_IO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_SIM_IO))
 
 from sim_io.flow import (
-    PhaseAResult,
+    DutContext,
+    load_dut_context,
     load_llm_result,
     classify_pin,
 )
@@ -41,7 +42,7 @@ from sim_io.pin_types import ClassificationResult, PinClassification, PinInfo
 
 
 def run_maestro_runner(
-    phase_a: PhaseAResult,
+    dut_context: DutContext,
     *,
     classifications: dict[str, PinClassification] | None = None,
     classif_result: ClassificationResult | None = None,
@@ -56,15 +57,15 @@ def run_maestro_runner(
     if client is None:
         client = VirtuosoClient.from_env()
 
-    lib = phase_a.lib
-    tb_cell = phase_a.tb_cell
-    pins = phase_a.pins
-    run_dir = phase_a.run_dir
-    vdd_value = phase_a.vdd_value
+    lib = dut_context.lib
+    tb_cell = dut_context.tb_cell
+    pins = dut_context.pins
+    run_dir = dut_context.run_dir
+    vdd_value = dut_context.vdd_value
 
     # Re-derive classifications if not provided
     if classifications is None:
-        classif_result = classif_result or load_llm_result(run_dir, cell=phase_a.primary_cell)
+        classif_result = classif_result or load_llm_result(run_dir, cell=dut_context.primary_cell)
         from sim_io.pin_types import build_classification_map
         classifications = build_classification_map(classif_result) if classif_result else {}
 
@@ -146,17 +147,13 @@ def run_maestro_runner(
     return sim_run_ok, None, plot_paths
 
 
-# Backward compat alias
-run_phase_b2 = run_maestro_runner
-
-
 def _resolve_run_dir(explicit: str | None) -> Path:
     if explicit:
         return Path(explicit)
     latest = _SIM_IO / ".latest_run"
     if not latest.exists():
         raise FileNotFoundError(
-            ".latest_run not found — run symbol_export first or pass --run-dir"
+            ".latest_run not found 鈥?run symbol_export first or pass --run-dir"
         )
     return Path(latest.read_text(encoding="utf-8").strip())
 
@@ -171,7 +168,7 @@ def _load_classifications(run_dir: Path, cell: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="SIM-IO Maestro Runner — Maestro setup + optional simulation"
+        description="SIM-IO Maestro Runner 鈥?Maestro setup + optional simulation"
     )
     parser.add_argument("--run-dir", metavar="PATH",
                         help="Run directory from symbol_export (default: reads .latest_run)")
@@ -187,23 +184,23 @@ if __name__ == "__main__":
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    phase_a_json = run_dir / "phase_a_result.json"
-    if not phase_a_json.exists():
-        print(f"ERROR: {phase_a_json} not found — run symbol_export first.", file=sys.stderr)
+    try:
+        dut_context = load_dut_context(run_dir)
+    except FileNotFoundError as exc:
+        print(f"ERROR: {exc}; run symbol_export first.", file=sys.stderr)
         sys.exit(1)
 
     classif_json = run_dir / "pin_classifications.json"
     if not classif_json.exists():
-        print(f"WARNING: {classif_json} not found — falling back to heuristic classification.",
+        print(f"WARNING: {classif_json} not found 鈥?falling back to heuristic classification.",
               file=sys.stderr)
 
     try:
-        phase_a = PhaseAResult.load(phase_a_json)
-        classifications, classif_result = _load_classifications(run_dir, phase_a.primary_cell)
+        classifications, classif_result = _load_classifications(run_dir, dut_context.primary_cell)
         client = VirtuosoClient.from_env()
 
         sim_ok, sim_verdict, _ = run_maestro_runner(
-            phase_a,
+            dut_context,
             classifications=classifications,
             classif_result=classif_result,
             run_sim=args.run_sim,

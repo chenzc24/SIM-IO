@@ -4,11 +4,11 @@ Converts the Maestro per-point output table (from read_results()) into a
 per-pin measurements dict.  For pass/fail verification, read maestro_detail.csv
 which contains Maestro's own spec evaluation results.
 
-Output name → pin metric mapping (set up by _auto_generate_outputs in setup.py):
-  vmax_<pin>  →  pins[pin]["vmax"]   (ymax of transient voltage)
-  vmin_<pin>  →  pins[pin]["vmin"]   (ymin of transient voltage)
-  I_<pin>     →  pins[pin]["iavg"]   (branch current, taken as abs)
-  P_<pin>     →  pins[pin]["pavg"]   (v * i power expression, taken as abs)
+Output name 鈫?pin metric mapping (set up by _auto_generate_outputs in setup.py):
+  vmax_<pin>  鈫? pins[pin]["vmax"]   (ymax of transient voltage)
+  vmin_<pin>  鈫? pins[pin]["vmin"]   (ymin of transient voltage)
+  I_<pin>     鈫? pins[pin]["iavg"]   (branch current, taken as abs)
+  P_<pin>     鈫? pins[pin]["pavg"]   (v * i power expression, taken as abs)
 """
 
 from __future__ import annotations
@@ -24,12 +24,12 @@ def parse_maestro_measurements(
     classifications: dict | None = None,
     vdd: float = 1.8,
 ) -> dict:
-    """Convert MaestroSimResult.points → measurements.json-compatible dict.
+    """Convert MaestroSimResult.points 鈫?measurements.json-compatible dict.
 
     Parameters
     ----------
     mae_result     : result from run_maestro_sim()
-    pins           : pin list from phase_a (PinInfo objects)
+    pins           : pin list from DutContext (PinInfo objects)
     classifications: LLM pin_classifications dict {pin_name: PinClassification}
     vdd            : supply voltage (for context, not used in mapping)
 
@@ -61,7 +61,7 @@ def parse_maestro_measurements(
         }
 
     # Flatten all per-point scalar outputs into {output_name: float}.
-    # Single Run mode has exactly one point; sweeps have more — take first.
+    # Single Run mode has exactly one point; sweeps have more 鈥?take first.
     #
     # Maestro CSV column mapping is inconsistent between versions and
     # single-run vs sweep modes.  Sometimes the "Nominal" column contains
@@ -73,7 +73,7 @@ def parse_maestro_measurements(
         for out_name, info in (pt.get("outputs") or {}).items():
             if not isinstance(info, dict):
                 continue
-            # Try "value" then "spec" — whichever yields a float first
+            # Try "value" then "spec" 鈥?whichever yields a float first
             for field in ("value", "spec"):
                 val_str = (info.get(field) or "").strip()
                 if not val_str or val_str.lower() in ("nil", "n/a", "---", ""):
