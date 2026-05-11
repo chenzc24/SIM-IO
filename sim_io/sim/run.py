@@ -62,6 +62,34 @@ def _resolve_psf_dir(run_dir: Path, deck_path: Path) -> Path:
     return candidates[0]
 
 
+def _load_primary_psf_data(run_dir: Path, deck_path: Path) -> dict:
+    """Load measurement data with SIM-IO's parser instead of Bridge internals."""
+    try:
+        from sim_io.sim.viz import DCSweepData, TranData, parse_psf_ascii
+    except Exception:
+        return {}
+
+    psf_dir = _resolve_psf_dir(run_dir, deck_path)
+    if not psf_dir.exists():
+        return {}
+
+    files = [p for p in sorted(psf_dir.glob("*")) if p.is_file()]
+    tran_files = [p for p in files if "tran" in p.name.lower()]
+    dc_files = [p for p in files if "dc" in p.name.lower()]
+
+    for psf_file in tran_files + dc_files:
+        try:
+            parsed = parse_psf_ascii(psf_file)
+        except Exception:
+            continue
+        if isinstance(parsed, TranData):
+            return {"time": parsed.time, **parsed.signals}
+        if isinstance(parsed, DCSweepData):
+            return {parsed.sweep_var: parsed.sweep_values, **parsed.signals}
+
+    return {}
+
+
 # ── Template Helpers ────────────────────────────────────────────
 
 def _load_si_env_template() -> str:
@@ -486,6 +514,9 @@ def run_spectre(
     )
 
     result = sim.run_simulation(deck_path, {})
+    primary_data = _load_primary_psf_data(run_dir, deck_path)
+    if primary_data:
+        result.data = primary_data
 
     if result.ok:
         signals = list(result.data.keys())
